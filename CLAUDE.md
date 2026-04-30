@@ -20,20 +20,40 @@ No spreads, no condors, no theta strategies. Pure directional swing plays.
 Finviz (technicals + setup) → Reddit (sentiment) → Polygon (options chain + greeks) → Scorer → Streamlit UI
 ```
 
-**Pass 1 (fast, parallel):** Finviz-only scan for all tickers. Filters by setup pattern.  
+**Pass 1 (fast, parallel):** Finviz-only scan for all tickers. Filters by setup pattern.
 **Pass 2 (slow, sequential):** Options chain fetch from Polygon only for setup-matched tickers.
 
 ### Files
 | File | Purpose |
 |---|---|
-| `app.py` | Streamlit UI — strategies, filters, detail panel, journal tab |
+| `app.py` | Streamlit UI — 4 tabs: Scanner, Deep Dive, Trade Decision, Journal |
 | `screener/finviz_client.py` | Finviz technicals + yfinance OHLC (HV30, ATR, earnings, consolidation trigger) |
-| `screener/polygon_client.py` | Polygon options chain + unusual activity detection |
+| `screener/polygon_client.py` | Polygon options chain, unusual activity, sweep detection, most-active sampler |
 | `screener/scorer.py` | Composite scoring, strike selection, ScreenerResult dataclass |
 | `screener/stocktwits_client.py` | Reddit sentiment (wallstreetbets, stocks, options, investing) |
 | `screener/universe.py` | Dow30, NASDAQ-100, S&P-500 ticker lists (Wikipedia scrape) |
 | `screener/etf_universe.py` | 71 US ETFs across 11 categories with hardcoded top-10 holdings |
 | `screener/journal.py` | SQLite trade journal with Black-Scholes live P&L repricing |
+| `screener/intraday.py` | yfinance 1-min bars, session VWAP, relative strength vs SPY, GEX flip level |
+| `screener/conviction.py` | 0-100 conviction scorer (7 signals) + entry card builder |
+| `screener/oi_tracker.py` | SQLite OI snapshots — daily OI delta tracking per contract |
+| `screener/ticker_analysis.py` | PCR, max pain, net GEX, GEX by strike, OI walls, top unusual flow |
+
+---
+
+## Tabs
+
+### 📊 Scanner
+Main swing trade screener. Two-pass scan (Finviz → Polygon). Pinned "Most Active Options Today" at top.
+
+### 🔍 Ticker Deep Dive
+Full options chain for any ticker. Call/put OI walls with expiry dates and OI delta (daily change). Sweep detection expander. IV history row.
+
+### 🎯 Trade Decision Panel
+Real-time confluence panel for intraday option entries. Scores 7 signals (0–100). Shows full entry card and VWAP chart. Quick save to journal.
+
+### 📓 Journal
+SQLite-backed trade log. Live Black-Scholes P&L repricing. Statuses: Watching → Entered → Closed.
 
 ---
 
@@ -45,7 +65,7 @@ WEIGHTS = {
     "sentiment":        0.10,   # Reddit — demoted, useful only as contrarian context
 }
 ```
-Score range: -2.0 (strong bearish) → +2.0 (strong bullish)  
+Score range: -2.0 (strong bearish) → +2.0 (strong bullish)
 |score| > 0.5 required to generate a strategy recommendation.
 
 ---
@@ -119,6 +139,79 @@ Institutional flow signal — NOT retail noise:
 
 ---
 
+## Most Active Options (`polygon_client.py → get_top_volume_options()`)
+Samples ~55 high-liquidity tickers (index ETFs, sector ETFs, mega-caps, semis, finance, energy, biotech, high-vol names). Fetches top 250 contracts per ticker in parallel (8 threads), deduplicates to 1 contract per ticker (highest volume), returns top 25 unique tickers sorted by volume.
+
+- Uses per-ticker `/v3/snapshot/options/{symbol}` — **works on Polygon Starter plan**
+- Global endpoint `/v3/snapshot/options` (no ticker) requires paid plan — not used
+- Cached 5 min in Streamlit via `@st.cache_data(ttl=300)`
+
+---
+
+## Sweep Detection (`polygon_client.py → detect_sweeps()`)
+Identifies institutional sweep orders from trade prints:
+- 2+ fills within a 2-second window totalling ≥ 50 contracts
+- Fills at/above ask × 0.98 = aggressive bullish BUY sweep
+- Fills at/below ask × 0.80 = aggressive bearish SELL sweep
+- Requires Polygon plan with options trades access (`/v3/trades/{optionSymbol}`)
+
+---
+
+## OI Change Tracking (`screener/oi_tracker.py`)
+- SQLite at `data/oi_tracker.db`, table `oi_snapshots`
+- `save_snapshot(symbol, chain)` — writes today's OI per contract
+- `get_oi_change(symbol, chain)` — returns OI delta vs yesterday per contract
+- `get_iv_history(symbol, days)` — returns daily avg IV trend for a ticker
+- OI Δ column shown in call/put walls of Deep Dive tab
+
+---
+
+## Conviction Scorer (`screener/conviction.py → score_trade()`)
+0-100 composite score across 7 signals for intraday entries:
+
+| Signal | Max Pts | Source |
+|---|---|---|
+| VWAP alignment | 20 | yfinance 1-min bars (session VWAP) |
+| Relative strength vs SPY | 15 | yfinance (symbol % chg − SPY % chg) |
+| Options flow / PCR | 15 | Polygon chain (put/call volume ratio) |
+| GEX structure | 15 | Polygon chain (gamma exposure flip level) |
+| IV regime | 10 | avg_iv / hv30 premium ratio |
+| Sweep confirmation | 15 | Polygon trades endpoint |
+| Max pain gravity | 10 | Polygon chain (max pain strike) |
+
+Grades: 80–100 = HIGH CONVICTION · 60–79 = MODERATE · 40–59 = MARGINAL · 0–39 = PASS
+
+---
+
+## Entry Card (`screener/conviction.py → build_entry_card()`)
+Displayed in Trade Decision tab as 4 full-width rows of 4 metrics each:
+- Row 1: Direction · Strike · Expiry · DTE
+- Row 2: Entry Premium · Cost/Contract · Delta · IV
+- Row 3: Breakeven · % to Breakeven · Stock Target · Target Premium
+- Row 4: Stop Premium (−50%) · R:R · Max Pain · GEX Flip
+
+Target premium = intrinsic value at tech target + 20% residual time value.
+Stop = −50% of entry premium (standard long-option rule).
+
+---
+
+## Intraday Data (`screener/intraday.py`)
+- **Source: yfinance** (free, no API key) — `yf.download(sym, period="1d", interval="1m")`
+- Polygon intraday bars removed — requires paid plan
+- Session VWAP = `cumsum(TP × Vol) / cumsum(Vol)` computed from 1-min bars
+- `get_relative_strength()` returns: symbol_chg, bench_chg, rs_ratio, vs_vwap, vwap, current, day_high, day_low, bars DataFrame
+- `gex_flip_level()` — cumulative GEX by strike, returns strike where sign crosses zero
+
+---
+
+## Polygon API Error Handling
+- `_last_api_error: dict` — module-level variable in `polygon_client.py`
+- Populated by `_get()` for 401 (bad key), 403 (wrong plan), 429 (rate limited), other errors; cleared on success
+- Sidebar health check cached 60s via `@st.cache_data(ttl=60)` — prevents rate-limit exhaustion from firing on every rerender
+- Error detail shown in sidebar when 🔴 and in Trade Decision error message
+
+---
+
 ## Earnings Filter
 - `days_to_earnings` from `yfinance.Ticker(sym).calendar["Earnings Date"][0]`
 - `earnings_within_dte = days_to_earnings <= dte_max`
@@ -134,6 +227,8 @@ Institutional flow signal — NOT retail noise:
 - Live P&L repricing: Black-Scholes using yfinance spot price
 - Tracks: entry premium, delta, IV, strike, expiry, stock price, all price targets
 - Realized P&L computed on close: `(exit_price − entry_premium) / entry_premium × 100`
+- `add_entry_raw()` — saves directly from Trade Decision panel (no ScreenerResult needed)
+- SQLite can return numeric columns as bytes — use `_safe_float()` helper in app.py to decode
 
 ---
 
@@ -150,11 +245,16 @@ ETF drill-down: scan top holdings of a selected ETF for confluence (ETF consolid
 
 ## Known Constraints
 - **Polygon Starter plan** has no live bid/ask quotes — all prices are Black-Scholes theoretical
+- **Polygon global options snapshot** (`/v3/snapshot/options` with no ticker) requires paid plan — use per-ticker sampler instead
+- **Polygon intraday bars** (`/v2/aggs/ticker/{sym}/range/1/minute/...`) may require paid plan — use yfinance instead
 - **Finviz ATR** field key is `"ATR (14)"` not `"ATR"`
 - **yfinance calendar** returns a `dict` not a DataFrame — parse with `cal["Earnings Date"][0]`
+- **yfinance 1-min download** returns multi-level columns — flatten with `col[0].lower()`
 - **Wikipedia NASDAQ-100** scrape uses `requests` + `StringIO` because macOS urllib has SSL cert issues
-- **ThreadPoolExecutor closures** defined inside Streamlit button blocks fail silently — all scan helpers (`_fetch_tech_only`, `_fetch_full_result`) must be at module level
+- **ThreadPoolExecutor closures** defined inside Streamlit button blocks fail silently — all scan helpers must be at module level
 - **Streamlit widget/state key conflict** — button keys and session state keys must be different strings
+- **`st.stop()` blocks all tabs** — never use inside a `with tab:` block; wrap tab content in a function and use `return`
+- **SQLite bytes columns** — strike and numeric fields can come back as `bytes`; decode with `int.from_bytes(v, 'little')` via `_safe_float()` helper
 
 ---
 

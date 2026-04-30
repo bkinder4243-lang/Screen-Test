@@ -98,6 +98,48 @@ def add_entry(r, status: str = "Watching", notes: str = "") -> int:
         return cur.lastrowid
 
 
+def add_entry_raw(
+    symbol: str,
+    strategy: str,
+    setup: str,
+    signal: str,
+    strike: Optional[float],
+    contract_type: str,
+    expiry: Optional[str],
+    dte: Optional[int],
+    entry_premium: Optional[float],
+    delta: Optional[float],
+    iv: Optional[float],
+    stock_price: Optional[float],
+    technical_target: Optional[float] = None,
+    analyst_target: Optional[float] = None,
+    option_breakeven: Optional[float] = None,
+    pct_to_breakeven: Optional[float] = None,
+    composite_score: Optional[float] = None,
+    status: str = "Watching",
+    notes: str = "",
+) -> int:
+    """Save a trade directly without a ScreenerResult. Used by Trade Decision panel."""
+    with _conn() as con:
+        cur = con.execute("""
+            INSERT INTO journal (
+                added_date, symbol, strategy, setup, signal, composite_score,
+                strike, contract_type, expiry, dte_at_entry,
+                entry_premium, entry_delta, entry_iv, stock_price_entry,
+                technical_target, analyst_target, option_breakeven, pct_to_breakeven,
+                status, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            symbol, strategy, setup, signal, composite_score,
+            strike, contract_type, expiry, dte,
+            entry_premium, delta, iv, stock_price,
+            technical_target, analyst_target, option_breakeven, pct_to_breakeven,
+            status, notes,
+        ))
+        return cur.lastrowid
+
+
 def get_entries(status_filter: str = "All") -> pd.DataFrame:
     """Load journal entries. status_filter: All | Watching | Entered | Closed."""
     with _conn() as con:

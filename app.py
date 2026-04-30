@@ -9,15 +9,20 @@ sys.path.insert(0, os.path.dirname(__file__))
 import streamlit as st
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from screener.polygon_client    import get_options_chain, get_unusual_activity, key_is_working
+from screener.polygon_client    import (get_options_chain, get_unusual_activity, key_is_working,
+                                        get_top_volume_options, get_option_trades, detect_sweeps,
+                                        get_option_iv_history)
 from screener.finviz_client     import get_technicals
+from screener.oi_tracker        import save_snapshot, get_oi_change, get_iv_history
 from screener.stocktwits_client import get_sentiment
 from screener.scorer            import build_result, ScreenerResult
 from screener.universe          import load_universe, UNIVERSES
 from screener.etf_universe      import ETF_UNIVERSE, get_etf_holdings, etf_category
-from screener.journal           import add_entry, get_entries, close_entry, delete_entry, reprice_all_open, update_notes
+from screener.journal           import add_entry, add_entry_raw, get_entries, close_entry, delete_entry, reprice_all_open, update_notes
 from screener.ticker_analysis   import full_analysis
 from screener.polygon_client    import get_spot_price
+from screener.intraday          import get_relative_strength, gex_flip_level
+from screener.conviction        import score_trade, build_entry_card
 
 st.set_page_config(page_title="Options Screener", page_icon="📊", layout="wide")
 
@@ -158,9 +163,16 @@ STRATEGY_NAMES = list(STRATEGIES.keys()) + ["🛠️ Custom Strategy"]
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("⚙️ Settings")
 
-poly_ok = key_is_working()
+@st.cache_data(ttl=60)
+def _check_polygon_key():
+    return key_is_working()
+
+poly_ok = _check_polygon_key()
+from screener.polygon_client import _last_api_error as _poly_err
+_poly_status = "🟢" if poly_ok else "🔴"
+_poly_detail  = f" — {_poly_err['msg']}" if not poly_ok and _poly_err.get("msg") else ""
 st.sidebar.markdown(
-    f"{'🟢' if poly_ok else '🔴'} Polygon.io (options + greeks)  \n"
+    f"{_poly_status} Polygon.io (options + greeks){_poly_detail}  \n"
     "🟢 Finviz (technicals)  \n"
     "🟢 Reddit (sentiment)"
 )
@@ -283,7 +295,7 @@ exclude_earnings = st.sidebar.checkbox("🚫 Exclude earnings risk", value=True,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.title("📊 Options Swing Screener")
-tab_scanner, tab_deep, tab_journal = st.tabs(["📊 Scanner", "🔍 Ticker Deep Dive", "📓 Journal"])
+tab_scanner, tab_deep, tab_decide, tab_journal = st.tabs(["📊 Scanner", "🔍 Ticker Deep Dive", "🎯 Trade Decision", "📓 Journal"])
 
 
 # ── Scan helpers ──────────────────────────────────────────────────────────────
@@ -342,8 +354,62 @@ def _confluence_label(holding_setup: str, etf_setup: str) -> str:
     return "⚪ Neutral"
 
 
+# ── Most-active options cache (5-min TTL) ─────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_top_volume():
+    return get_top_volume_options(top_n=25)
+
+
 # ── Scanner tab ───────────────────────────────────────────────────────────────
-with tab_scanner:
+def _render_scanner_tab():
+    # ── Pinned: most active options today ─────────────────────────────────────
+    with st.expander("🔥 Most Active Options Today", expanded=True):
+        col_refresh, col_note = st.columns([1, 5])
+        with col_refresh:
+            if st.button("↺ Refresh", key="refresh_top_vol", help="Re-fetch top volume (cached 5 min)"):
+                st.cache_data.clear()
+        with col_note:
+            st.caption("Top 25 contracts by volume across the entire US options market · refreshes every 5 min")
+
+        with st.spinner("Loading most active options…"):
+            tv = _cached_top_volume()
+
+        if tv.empty:
+            st.warning(
+                "Market-wide options snapshot unavailable. "
+                "This endpoint may require a Polygon plan above Starter. "
+                "Check your plan at polygon.io/dashboard."
+            )
+        else:
+            disp = tv.copy()
+            disp["type"]          = disp["type"].str.upper()
+            disp["strike"]        = disp["strike"].apply(lambda x: f"${x:.0f}")
+            disp["mid"]           = disp["mid"].apply(lambda x: f"${x:.2f}")
+            disp["iv"]            = disp["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+            disp["delta"]         = disp["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+            disp["volume"]        = disp["volume"].apply(lambda x: f"{int(x):,}")
+            disp["open_interest"] = disp["open_interest"].apply(lambda x: f"{int(x):,}")
+            if "notional" in disp.columns:
+                disp["notional"] = disp["notional"].apply(
+                    lambda x: f"${x/1_000_000:.1f}M" if x >= 1_000_000 else f"${int(x):,}"
+                )
+            col_rename = {
+                "ticker": "Ticker", "type": "Type", "strike": "Strike",
+                "expiration": "Expiry", "dte": "DTE", "volume": "Volume",
+                "open_interest": "OI", "mid": "Mid", "iv": "IV",
+                "delta": "Delta", "notional": "Notional",
+            }
+            ordered = ["ticker","type","strike","expiration","dte","volume","open_interest","mid","iv","delta","notional"]
+            disp = disp[[c for c in ordered if c in disp.columns]].rename(columns=col_rename)
+            st.dataframe(
+                disp, hide_index=True, use_container_width=True,
+                column_config={
+                    col: st.column_config.TextColumn(width="small")
+                    for col in disp.columns if col != "Expiry"
+                },
+            )
+
+    st.divider()
     st.markdown(f"### {selected_strategy}")
     st.caption(strat["description"])
 
@@ -369,7 +435,7 @@ with tab_scanner:
     if st.button("▶ Run Screener", type="primary"):
         if not tickers:
             st.error("No tickers loaded. Check your universe selection.")
-            st.stop()
+            return
 
         raw_results = []
         prog  = st.progress(0)
@@ -430,7 +496,7 @@ with tab_scanner:
 
     if "results" not in st.session_state:
         st.info("Configure your strategy and tickers in the sidebar, then click **▶ Run Screener**.")
-        st.stop()
+        return
 
     results = st.session_state["results"]
 
@@ -510,7 +576,7 @@ with tab_scanner:
                     "Delta":     f"{r.rec_delta:.2f}" if r.rec_delta else "—",
                 })
             st.dataframe(pd.DataFrame(debug_rows), hide_index=True, use_container_width=True)
-        st.stop()
+        return
 
     # ── Results table ─────────────────────────────────────────────────────────
     st.subheader(f"Matches — {selected_strategy}")
@@ -772,6 +838,9 @@ with tab_scanner:
                     disp[g] = disp[g].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
                 st.dataframe(disp, use_container_width=True, hide_index=True, height=380)
 
+with tab_scanner:
+    _render_scanner_tab()
+
 # ── Deep Dive tab ─────────────────────────────────────────────────────────────
 with tab_deep:
     st.markdown("### 🔍 Single-Ticker Options Analysis")
@@ -797,6 +866,9 @@ with tab_deep:
         elif not dd_spot:
             st.error(f"Could not fetch spot price for **{dd_sym}**.")
         else:
+            # Persist OI + IV snapshot for change tracking
+            save_snapshot(dd_sym, dd_chain)
+            dd_chain = get_oi_change(dd_sym, dd_chain)
             st.session_state["dd_result"] = {
                 "sym":   dd_sym,
                 "chain": dd_chain,
@@ -836,7 +908,6 @@ with tab_deep:
             )
 
             # ── Row 1: Key metrics ─────────────────────────────────────────────
-            m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
             pv = pcr_d.get("pcr_volume")
             po = pcr_d.get("pcr_oi")
             gex_bn = net_g / 1_000_000_000
@@ -847,59 +918,122 @@ with tab_deep:
                 if v > 1.0:   return "bearish"
                 return "neutral"
 
-            m1.metric("Spot",          f"${spot:.2f}")
-            m2.metric("Max Pain",      f"${pain:.2f}" if pain else "—",
-                      delta=f"{(spot-pain)/pain*100:+.1f}%" if pain else None)
-            m3.metric("PCR (volume)",  f"{pv:.2f}" if pv else "—",
-                      delta=_pcr_delta(pv), delta_color="inverse")
-            m4.metric("PCR (OI)",      f"{po:.2f}" if po else "—")
-            m5.metric("Call Volume",   f"{pcr_d['call_volume']:,}")
-            m6.metric("Put Volume",    f"{pcr_d['put_volume']:,}")
-            m7.metric("Net GEX",       f"${gex_bn:+.2f}B",
+            ma, mb, mc, md = st.columns(4)
+            ma.metric("Spot",      f"${spot:.2f}")
+            mb.metric("Max Pain",  f"${pain:.2f}" if pain else "—",
+                      delta=f"{(spot-pain)/pain*100:+.1f}% from spot" if pain else None)
+            mc.metric("Net GEX",   f"${gex_bn:+.2f}B",
                       delta="Pinning" if gex_bn > 0 else "Vol expansion",
                       delta_color="normal" if gex_bn > 0 else "inverse")
+            md.metric("PCR (vol)", f"{pv:.2f}" if pv else "—",
+                      delta=_pcr_delta(pv), delta_color="inverse")
+
+            me, mf, mg, mh = st.columns(4)
+            me.metric("PCR (OI)",    f"{po:.2f}" if po else "—")
+            mf.metric("Call Volume", f"{pcr_d['call_volume']:,}")
+            mg.metric("Put Volume",  f"{pcr_d['put_volume']:,}")
+            mh.metric("Call OI",     f"{pcr_d['call_oi']:,}")
 
             st.divider()
 
             # ── Row 2: Walls + Unusual Flow ────────────────────────────────────
             w1, w2, w3 = st.columns(3)
 
+            def _fmt_oi_change(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return "—"
+                v = int(v)
+                return f"+{v:,}" if v > 0 else f"{v:,}"
+
             with w1:
-                st.markdown("**📈 Call Walls (resistance / upside targets)**")
+                st.markdown("**📈 Call Walls**")
                 cw = walls["call_walls"].copy()
-                cw.columns = ["Strike", "Open Interest", "Volume"]
-                cw["Strike"] = cw["Strike"].apply(lambda x: f"${x:.2f}")
-                cw["Open Interest"] = cw["Open Interest"].apply(lambda x: f"{int(x):,}")
-                cw["Volume"] = cw["Volume"].apply(lambda x: f"{int(x):,}")
-                st.dataframe(cw, hide_index=True, use_container_width=True)
+                # Merge OI change for wall strikes from the chain
+                if "oi_change" in chain.columns:
+                    oi_ch = (chain[chain["type"] == "call"]
+                             .groupby("strike")["oi_change"].sum().reset_index()
+                             .rename(columns={"oi_change": "_oi_ch"}))
+                    cw = cw.merge(oi_ch, on="strike", how="left")
+                    cw["OI Δ"] = cw["_oi_ch"].apply(_fmt_oi_change)
+                cw["strike"]        = cw["strike"].apply(lambda x: f"${x:.0f}")
+                cw["open_interest"] = cw["open_interest"].apply(lambda x: f"{int(x):,}")
+                cw["volume"]        = cw["volume"].apply(lambda x: f"{int(x):,}")
+                rename_cw = {"strike": "Strike", "expiration": "Expiry",
+                             "open_interest": "OI", "volume": "Vol"}
+                cw = cw.rename(columns=rename_cw)
+                show_cw = [c for c in ["Strike","Expiry","OI","OI Δ","Vol"] if c in cw.columns]
+                st.dataframe(cw[show_cw], hide_index=True, use_container_width=True,
+                             column_config={c: st.column_config.TextColumn(width="small")
+                                            for c in show_cw if c != "Expiry"})
 
             with w2:
-                st.markdown("**📉 Put Walls (support / downside levels)**")
+                st.markdown("**📉 Put Walls**")
                 pw = walls["put_walls"].copy()
-                pw.columns = ["Strike", "Open Interest", "Volume"]
-                pw["Strike"] = pw["Strike"].apply(lambda x: f"${x:.2f}")
-                pw["Open Interest"] = pw["Open Interest"].apply(lambda x: f"{int(x):,}")
-                pw["Volume"] = pw["Volume"].apply(lambda x: f"{int(x):,}")
-                st.dataframe(pw, hide_index=True, use_container_width=True)
+                if "oi_change" in chain.columns:
+                    oi_ch = (chain[chain["type"] == "put"]
+                             .groupby("strike")["oi_change"].sum().reset_index()
+                             .rename(columns={"oi_change": "_oi_ch"}))
+                    pw = pw.merge(oi_ch, on="strike", how="left")
+                    pw["OI Δ"] = pw["_oi_ch"].apply(_fmt_oi_change)
+                pw["strike"]        = pw["strike"].apply(lambda x: f"${x:.0f}")
+                pw["open_interest"] = pw["open_interest"].apply(lambda x: f"{int(x):,}")
+                pw["volume"]        = pw["volume"].apply(lambda x: f"{int(x):,}")
+                rename_pw = {"strike": "Strike", "expiration": "Expiry",
+                             "open_interest": "OI", "volume": "Vol"}
+                pw = pw.rename(columns=rename_pw)
+                show_pw = [c for c in ["Strike","Expiry","OI","OI Δ","Vol"] if c in pw.columns]
+                st.dataframe(pw[show_pw], hide_index=True, use_container_width=True,
+                             column_config={c: st.column_config.TextColumn(width="small")
+                                            for c in show_pw if c != "Expiry"})
 
             with w3:
-                st.markdown("**🔥 Top Unusual Flow (vol/OI × notional)**")
+                st.markdown("**🔥 Top Unusual Flow**")
                 if not flow.empty:
                     fl = flow.copy()
-                    fl["iv"]         = fl["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
-                    fl["delta"]      = fl["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-                    fl["mid"]        = fl["mid"].apply(lambda x: f"${x:.2f}")
-                    fl["notional"]   = fl["notional"].apply(lambda x: f"${int(x):,}")
+                    fl["iv"]           = fl["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+                    fl["delta"]        = fl["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                    fl["mid"]          = fl["mid"].apply(lambda x: f"${x:.2f}")
+                    fl["notional"]     = fl["notional"].apply(lambda x: f"${int(x):,}")
                     fl["vol_oi_ratio"] = fl["vol_oi_ratio"].apply(lambda x: f"{x:.1f}x")
-                    fl["strike"]     = fl["strike"].apply(lambda x: f"${x:.2f}")
-                    fl["type"]       = fl["type"].str.upper()
-                    st.dataframe(
-                        fl[["type","strike","expiration","dte","volume","vol_oi_ratio","notional","mid","delta","iv"]],
-                        hide_index=True, use_container_width=True,
-                        column_config={"type": st.column_config.TextColumn("Type", width="small")}
-                    )
+                    fl["strike"]       = fl["strike"].apply(lambda x: f"${x:.2f}")
+                    fl["type"]         = fl["type"].str.upper()
+                    show_fl = [c for c in ["type","strike","expiration","dte","volume",
+                                           "vol_oi_ratio","notional","mid","delta","iv"]
+                               if c in fl.columns]
+                    st.dataframe(fl[show_fl], hide_index=True, use_container_width=True,
+                                 column_config={"type": st.column_config.TextColumn("Type", width="small")})
                 else:
                     st.info("No unusual flow found (need vol ≥ 100, OI ≥ 50, notional ≥ $25K).")
+
+            st.divider()
+
+            # ── Sweep Detection ────────────────────────────────────────────────
+            with st.expander("🌊 Sweep Detection (institutional aggression)", expanded=True):
+                st.caption(
+                    "A sweep = 2+ fills within 2 seconds totalling ≥ 50 contracts. "
+                    "Sweeps at the ask = aggressive buying. Checks top 3 unusual-flow contracts."
+                )
+                if not flow.empty and "option_symbol" in flow.columns:
+                    top_contracts = flow["option_symbol"].dropna().head(3).tolist()
+                    any_sweeps = False
+                    for opt_sym in top_contracts:
+                        if not opt_sym:
+                            continue
+                        trades_df = get_option_trades(opt_sym, limit=200)
+                        sweeps = detect_sweeps(trades_df)
+                        if sweeps:
+                            any_sweeps = True
+                            st.markdown(f"**{opt_sym}**")
+                            sw_df = pd.DataFrame(sweeps)
+                            sw_df["notional"] = sw_df["notional"].apply(
+                                lambda x: f"${x/1_000_000:.2f}M" if x >= 1_000_000 else f"${x:,}"
+                            )
+                            sw_df.columns = ["Time", "Contracts", "Avg Price", "Fills", "Side", "Notional"]
+                            st.dataframe(sw_df, hide_index=True, use_container_width=True)
+                    if not any_sweeps:
+                        st.info("No sweeps detected on top unusual contracts. Either no aggressive fills today or trades endpoint requires plan upgrade.")
+                else:
+                    st.info("Run analysis with unusual flow data to enable sweep detection.")
 
             st.divider()
 
@@ -907,7 +1041,7 @@ with tab_deep:
             vc1, vc2 = st.columns(2)
 
             with vc1:
-                st.markdown("**⚡ Top Volume Contracts (most active today)**")
+                st.markdown("**⚡ Top Volume Contracts**")
                 if not clust.empty:
                     cl = clust.copy()
                     cl["iv"]       = cl["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
@@ -924,12 +1058,12 @@ with tab_deep:
                     st.info("No volume data.")
 
             with vc2:
-                st.markdown("**🌡️ Highest IV Contracts (most expensive premium)**")
+                st.markdown("**🌡️ Highest IV Contracts**")
                 if not hi_iv.empty:
                     hi = hi_iv.copy()
-                    hi["iv"]    = hi["iv"].apply(lambda x: f"{x:.0%}")
-                    hi["delta"] = hi["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-                    hi["mid"]   = hi["mid"].apply(lambda x: f"${x:.2f}")
+                    hi["iv"]     = hi["iv"].apply(lambda x: f"{x:.0%}")
+                    hi["delta"]  = hi["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                    hi["mid"]    = hi["mid"].apply(lambda x: f"${x:.2f}")
                     hi["strike"] = hi["strike"].apply(lambda x: f"${x:.2f}")
                     hi["type"]   = hi["type"].str.upper()
                     st.dataframe(
@@ -951,7 +1085,6 @@ with tab_deep:
                     t["avg_iv"] = t["avg_iv"].apply(lambda x: f"{x:.1%}")
                     t.columns   = ["DTE Bucket", "Avg IV", "# Contracts"]
                     st.dataframe(t, hide_index=True, use_container_width=True)
-                    # Backwardation warning
                     ivs = ana["term"]["avg_iv"].values
                     if len(ivs) >= 2 and ivs[0] > ivs[-1] * 1.15:
                         st.warning("⚠️ IV backwardation — near-term vol elevated. Likely event/earnings premium.")
@@ -959,7 +1092,7 @@ with tab_deep:
                     st.info("Not enough data for term structure.")
 
             with ts2:
-                st.markdown("**📐 IV Skew by Expiry** (call IV − put IV per expiry)")
+                st.markdown("**📐 IV Skew by Expiry** (call IV − put IV)")
                 if not skew.empty:
                     sk = skew.copy()
                     sk["call_iv"] = sk["call_iv"].apply(lambda x: f"{x:.1%}")
@@ -968,9 +1101,41 @@ with tab_deep:
                         lambda x: f"+{x:.1%} 📈" if x > 0.02 else (f"{x:.1%} 📉" if x < -0.02 else f"{x:.1%}")
                     )
                     st.dataframe(sk, hide_index=True, use_container_width=True)
-                    st.caption("Positive skew = call IV > put IV (bullish demand). Negative = normal protective buying.")
+                    st.caption("Positive = call IV > put IV (bullish demand). Negative = normal protective put buying.")
                 else:
                     st.info("Not enough data for skew.")
+
+            st.divider()
+
+            # ── IV History (stored snapshots) + Contract Price History ─────────
+            ih1, ih2 = st.columns(2)
+
+            with ih1:
+                st.markdown("**📈 IV History — avg IV over time**")
+                iv_hist = get_iv_history(sym, days=30)
+                if not iv_hist.empty and len(iv_hist) > 1:
+                    iv_hist_disp = iv_hist.rename(columns={"snapshot_date": "Date", "avg_iv": "Avg IV"})
+                    iv_hist_disp["Avg IV"] = iv_hist_disp["Avg IV"].round(4)
+                    st.line_chart(iv_hist_disp.set_index("Date")["Avg IV"])
+                    st.caption("Stored from each time you run Deep Dive on this ticker. Builds up over days.")
+                else:
+                    st.info("IV history builds as you run Deep Dive on this ticker over multiple days. Check back tomorrow.")
+
+            with ih2:
+                st.markdown("**💰 Contract Price History (top unusual contract)**")
+                if not flow.empty and "option_symbol" in flow.columns:
+                    top_opt = flow["option_symbol"].dropna().iloc[0] if len(flow) > 0 else None
+                    if top_opt:
+                        price_hist = get_option_iv_history(top_opt, days=30)
+                        if not price_hist.empty:
+                            st.line_chart(price_hist.set_index("date")[["close","vwap"]])
+                            st.caption(f"Daily close & VWAP for `{top_opt}` — requires options aggregates plan access.")
+                        else:
+                            st.info("No price history returned. Requires Polygon options aggregates access.")
+                    else:
+                        st.info("No unusual flow contract available.")
+                else:
+                    st.info("No unusual flow data.")
 
             st.divider()
 
@@ -978,13 +1143,13 @@ with tab_deep:
             with st.expander("📊 Gamma Exposure (GEX) by Strike", expanded=False):
                 if not gex_df.empty:
                     st.caption(
-                        "Positive GEX = dealers long gamma → price-pinning effect near that strike. "
+                        "Positive GEX = dealers long gamma → price-pinning near that strike. "
                         "Negative GEX = dealers short gamma → moves accelerate through that level."
                     )
                     gex_disp = gex_df.copy()
-                    gex_disp["gex_m"] = gex_disp["gex_m"].round(1)
+                    gex_disp["gex_m"]  = gex_disp["gex_m"].round(1)
                     gex_disp["strike"] = gex_disp["strike"].apply(lambda x: f"${x:.2f}")
-                    gex_disp.columns = ["Strike", "GEX ($M)", "GEX_M"]
+                    gex_disp.columns   = ["Strike", "GEX ($M)", "GEX_M"]
                     st.bar_chart(gex_disp.set_index("Strike")["GEX ($M)"])
                 else:
                     st.info("No gamma data — greeks not available from Polygon Starter plan on this ticker.")
@@ -993,6 +1158,241 @@ with tab_deep:
             with st.expander("🧭 Confluence Signals Detail", expanded=True):
                 for icon, msg in conf["signals"]:
                     st.markdown(f"{icon} {msg}")
+
+# ── Trade Decision tab ────────────────────────────────────────────────────────
+with tab_decide:
+    st.markdown("### 🎯 Trade Decision Panel")
+    st.caption("Enter a ticker and direction. Every signal scores green/yellow/red in real time. Pull the trigger only when score ≥ 60.")
+
+    td_c1, td_c2, td_c3, td_c4 = st.columns([2, 2, 2, 1])
+    with td_c1:
+        td_sym = st.text_input("Ticker", placeholder="e.g. NVDA", key="td_sym",
+                               label_visibility="collapsed").upper().strip()
+    with td_c2:
+        td_dir = st.radio("Direction", ["Long Call", "Long Put"],
+                          horizontal=True, key="td_dir", label_visibility="collapsed")
+    with td_c3:
+        td_dte = st.slider("Max DTE", 7, 60, 45, key="td_dte")
+    with td_c4:
+        td_run = st.button("▶ Analyze", key="td_run", type="primary", use_container_width=True)
+
+    if td_run and td_sym:
+        with st.spinner(f"Loading {td_sym} — intraday bars, options chain, flow…"):
+            # Always fetch full 90-day window; td_dte only filters strike selection
+            td_chain = get_options_chain(td_sym, dte_min=0, dte_max=90)
+            td_spot  = get_spot_price(td_sym)
+            td_rs    = get_relative_strength(td_sym)
+            td_fin   = get_technicals(td_sym)
+
+        if not td_spot:
+            st.error(f"Could not fetch price for {td_sym}.")
+        elif td_chain is None or td_chain.empty:
+            from screener.polygon_client import _last_api_error
+            _detail = _last_api_error.get("msg", "unknown error — check Polygon key and plan")
+            st.error(f"No options chain for {td_sym}. Polygon: {_detail}")
+        else:
+            st.session_state["td_result"] = {
+                "sym": td_sym, "dir": td_dir, "chain": td_chain,
+                "spot": td_spot, "rs": td_rs, "fin": td_fin,
+            }
+
+    if "td_result" not in st.session_state:
+        st.info("Enter a ticker and click **▶ Analyze** to score the trade.")
+    else:
+        td = st.session_state["td_result"]
+        sym   = td["sym"]
+        dirx  = td["dir"]
+        chain = td["chain"]
+        spot  = td["spot"]
+        rs    = td["rs"]
+        fin   = td["fin"] or {}
+
+        # ── Compute all signals ───────────────────────────────────────────────
+        from screener.ticker_analysis import (pcr, max_pain, net_gex,
+                                               top_unusual_flow, gex_by_strike)
+        import time as _time
+
+        last_updated = _time.strftime("%H:%M:%S")
+
+        pcr_d   = pcr(chain)
+        pain    = max_pain(chain)
+        gex_df  = gex_by_strike(chain, spot)
+        net_g   = net_gex(gex_df)
+        flip    = gex_flip_level(chain, spot)
+        flow    = top_unusual_flow(chain, top_n=8)
+
+        # IV premium
+        iv_vals = chain["iv"].dropna()
+        iv_vals = iv_vals[(iv_vals >= 0.05) & (iv_vals <= 3.0)]
+        avg_iv  = float(iv_vals.mean()) if not iv_vals.empty else None
+        hv30    = fin.get("hv_30")
+        iv_prem = round(avg_iv / hv30, 2) if avg_iv and hv30 and hv30 > 0 else None
+
+        # Best strike for entry card
+        bullish   = dirx == "Long Call"
+        opt_type  = "call" if bullish else "put"
+        side      = chain[(chain["type"] == opt_type) &
+                          (chain["dte"] >= 7) & (chain["dte"] <= td_dte) &
+                          (chain["mid"] > 0)]
+        best_row  = None
+        if not side.empty and "delta" in side.columns:
+            side = side[side["iv"].between(0.05, 3.0) | side["iv"].isna()].copy()
+            side["delta_diff"] = (side["delta"].abs() - 0.45).abs()
+            best_row = side.nsmallest(1, "delta_diff").iloc[0] if not side.empty else None
+
+        # Sweep check on top unusual contract
+        sweep_found = False
+        if not flow.empty and "option_symbol" in flow.columns:
+            top_opt = flow["option_symbol"].dropna().head(1).tolist()
+            if top_opt:
+                from screener.polygon_client import get_option_trades, detect_sweeps
+                td_trades = get_option_trades(top_opt[0], limit=200)
+                sweep_found = len(detect_sweeps(td_trades)) > 0
+
+        # Technical target from finviz
+        tech_target = fin.get("technical_target") if fin else None
+
+        # Score
+        result = score_trade(
+            direction=dirx, spot=spot, intraday=rs,
+            pcr_data=pcr_d, pain=pain, net_gex=net_g,
+            gex_flip=flip, flow=flow, iv_premium=iv_prem,
+            sweep_found=sweep_found,
+        )
+        score_val = result["score"]
+
+        # Entry card
+        card = build_entry_card(
+            symbol=sym, direction=dirx, spot=spot,
+            strike=float(best_row["strike"]) if best_row is not None else None,
+            premium=float(best_row["mid"])   if best_row is not None else None,
+            delta=float(best_row["delta"])   if best_row is not None and pd.notna(best_row.get("delta")) else None,
+            dte=int(best_row["dte"])         if best_row is not None else None,
+            expiry=str(best_row["expiration"]) if best_row is not None else None,
+            tech_target=tech_target,
+            iv=float(best_row["iv"])         if best_row is not None and pd.notna(best_row.get("iv")) else None,
+            score=score_val,
+        )
+
+        # ── Conviction banner ─────────────────────────────────────────────────
+        st.divider()
+        banner_fn = {"success": st.success, "warning": st.warning, "error": st.error}.get(result["color"], st.info)
+        banner_fn(
+            f"**{sym}** · {dirx} · Score **{score_val}/100** — **{result['grade']}**"
+            f"   ·   Last updated {last_updated}"
+        )
+
+        # ── Score bar ─────────────────────────────────────────────────────────
+        st.progress(score_val / 100)
+
+        st.divider()
+
+        # ── Entry card ────────────────────────────────────────────────────────
+        st.markdown("#### 📋 Entry Card")
+        if card["strike"]:
+            r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+            r1c1.metric("Direction",       dirx)
+            r1c2.metric("Strike",          f"${card['strike']:.2f}")
+            r1c3.metric("Expiry",          f"{card['expiry']}")
+            r1c4.metric("DTE",             f"{card['dte']} days")
+
+            r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+            r2c1.metric("Entry Premium",   f"${card['entry_mid']:.2f}")
+            r2c2.metric("Cost / Contract", f"${card['entry_cost']:.0f}" if card['entry_cost'] else "—")
+            r2c3.metric("Delta",           f"{card['delta']:.2f}" if card['delta'] else "—")
+            r2c4.metric("IV",              f"{card['iv']:.0%}" if card['iv'] else "—")
+
+            r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+            r3c1.metric("Breakeven",       f"${card['breakeven']:.2f}" if card['breakeven'] else "—")
+            r3c2.metric("% to Breakeven",  f"{card['pct_to_be']:+.1f}%" if card['pct_to_be'] is not None else "—")
+            r3c3.metric("Stock Target",    f"${card['tech_target']:.2f}" if card['tech_target'] else "—")
+            r3c4.metric("Target Premium",  f"${card['target_prem']:.2f}" if card['target_prem'] else "—")
+
+            r4c1, r4c2, r4c3, r4c4 = st.columns(4)
+            r4c1.metric("Stop Premium",    f"${card['stop_prem']:.2f}" if card['stop_prem'] else "—",
+                        delta="−50% of entry", delta_color="off")
+            r4c2.metric("R : R",           f"{card['rr']:.1f}×" if card['rr'] else "—",
+                        delta="✓ good" if (card['rr'] or 0) >= 1.5 else "↓ low",
+                        delta_color="normal" if (card['rr'] or 0) >= 1.5 else "inverse")
+            r4c3.metric("Max Pain",        f"${pain:.2f}" if pain else "—")
+            r4c4.metric("GEX Flip",        f"${flip:.2f}" if flip else "—")
+        else:
+            st.warning("No suitable strike found within DTE / delta filters.")
+
+        st.divider()
+
+        # ── Intraday snapshot ─────────────────────────────────────────────────
+        st.markdown("#### 📊 Intraday Snapshot")
+        bars = rs.get("bars", pd.DataFrame())
+        if not bars.empty:
+            chart_df = bars[["ts", "close", "session_vwap"]].copy()
+            chart_df = chart_df.set_index("ts").tail(120)
+            chart_df.columns = ["Price", "VWAP"]
+            st.line_chart(chart_df, color=["#60a5fa", "#f59e0b"])
+
+            id1, id2, id3, id4, id5 = st.columns(5)
+            id1.metric("Spot",     f"${spot:.2f}")
+            id2.metric("vs VWAP",  f"{rs['vs_vwap']:+.2f}%" if rs.get('vs_vwap') is not None else "—",
+                       delta_color="normal" if (rs.get('vs_vwap') or 0) > 0 else "inverse")
+            id3.metric("Day Chg",  f"{rs['symbol_chg']:+.2f}%" if rs.get('symbol_chg') is not None else "—")
+            id4.metric("vs SPY",   f"{rs['rs_ratio']:+.2f}%" if rs.get('rs_ratio') is not None else "—",
+                       delta_color="normal" if (rs.get('rs_ratio') or 0) > 0 else "inverse")
+            id5.metric("Day High / Low", f"${rs.get('day_high','—')} / ${rs.get('day_low','—')}")
+        else:
+            id1, id2, id3 = st.columns(3)
+            id1.metric("Spot",     f"${spot:.2f}")
+            id2.metric("GEX Flip", f"${flip:.2f}" if flip else "—")
+            id3.metric("Max Pain", f"${pain:.2f}" if pain else "—")
+
+        st.divider()
+
+        # ── Signal checklist ──────────────────────────────────────────────────
+        st.markdown("#### 🧭 Signal Breakdown")
+        for sig in result["signals"]:
+            icon, label, msg, pts, pts_max = sig
+            if pts_max > 0:
+                bar_pct = int(pts / pts_max * 100)
+                pts_str = f"**{pts}/{pts_max}**"
+            else:
+                bar_pct = 0
+                pts_str = ""
+            col_icon, col_label, col_msg, col_pts = st.columns([0.5, 1.5, 6, 1])
+            col_icon.markdown(icon)
+            col_label.markdown(f"**{label}**")
+            col_msg.markdown(msg)
+            if pts_str:
+                col_pts.markdown(pts_str)
+
+        st.divider()
+
+        # ── Quick save to journal ─────────────────────────────────────────────
+        st.markdown("#### 💾 Log This Trade")
+        if card["strike"]:
+            with st.form("td_journal_form"):
+                j_status = st.radio("Status", ["Watching", "Entered"], horizontal=True)
+                j_notes  = st.text_area("Notes", placeholder=f"Conviction {score_val}/100 — {result['grade']}", height=60)
+                if st.form_submit_button("📓 Save to Journal", type="primary"):
+                    eid = add_entry_raw(
+                        symbol=sym,
+                        strategy=dirx,
+                        setup=fin.get("setup", "—"),
+                        signal=fin.get("signal", "—"),
+                        strike=card["strike"],
+                        contract_type="call" if dirx == "Long Call" else "put",
+                        expiry=card["expiry"],
+                        dte=card["dte"],
+                        entry_premium=card["entry_mid"],
+                        delta=card["delta"],
+                        iv=card["iv"],
+                        stock_price=spot,
+                        technical_target=card["tech_target"],
+                        option_breakeven=card["breakeven"],
+                        pct_to_breakeven=card["pct_to_be"],
+                        composite_score=float(score_val),
+                        status=j_status,
+                        notes=j_notes or f"Conviction {score_val}/100 — {result['grade']}",
+                    )
+                    st.success(f"Saved **{sym}** to journal (#{eid}) as **{j_status}**.")
 
 # ── Journal tab ───────────────────────────────────────────────────────────────
 with tab_journal:
@@ -1054,10 +1454,19 @@ with tab_journal:
             dte_left  = rp.get("dte_remaining")
             expired   = rp.get("expired", False)
 
+            def _safe_float(v):
+                if v is None: return None
+                if isinstance(v, bytes):
+                    try: return float(int.from_bytes(v, 'little'))
+                    except: return None
+                try: return float(v)
+                except: return None
+            strike     = _safe_float(strike)
+            entry_prem = _safe_float(entry_prem)
             status_icon = {"Watching": "👁️", "Entered": "✅", "Closed": "🔒"}.get(status, "")
             header = (f"{status_icon} **{sym}** · {strategy} · "
                       f"${strike:.0f} strike · exp {expiry} · "
-                      f"entry ${entry_prem:.2f}" if entry_prem else
+                      f"entry ${entry_prem:.2f}" if (strike is not None and entry_prem) else
                       f"{status_icon} **{sym}** · {strategy} · exp {expiry}")
 
             with st.expander(header, expanded=(status == "Entered")):

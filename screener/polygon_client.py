@@ -28,23 +28,32 @@ def _api_key() -> str:
     return cfg.get("POLYGON_API_KEY", os.getenv("POLYGON_API_KEY", ""))
 
 
+_last_api_error: dict = {}   # module-level, readable by the UI
+
+
 def _get(path: str, params: dict) -> Optional[dict]:
     key = _api_key()
     if not key:
+        _last_api_error["msg"] = "No Polygon API key found in config/secrets.env"
         return None
     params["apiKey"] = key
     try:
-        r = requests.get(f"{BASE}{path}", params=params, timeout=10)
+        r = requests.get(f"{BASE}{path}", params=params, timeout=15)
         if r.status_code == 200:
+            _last_api_error.clear()
             return r.json()
         if r.status_code == 401:
-            logger.warning("Polygon 401 — check API key in config/secrets.env")
+            _last_api_error["msg"] = "401 Unauthorized — check API key"
         elif r.status_code == 403:
-            logger.warning(f"Polygon 403 — endpoint not in your plan: {path}")
+            _last_api_error["msg"] = f"403 Forbidden — endpoint not in your plan: {path}"
+        elif r.status_code == 429:
+            _last_api_error["msg"] = "429 Rate limited — too many requests, wait a moment"
         else:
-            logger.warning(f"Polygon {r.status_code} on {path}: {r.text[:100]}")
+            _last_api_error["msg"] = f"HTTP {r.status_code}: {r.text[:120]}"
+        logger.warning(f"Polygon {r.status_code} on {path}: {_last_api_error['msg']}")
         return None
     except Exception as e:
+        _last_api_error["msg"] = f"Request error: {e}"
         logger.warning(f"Polygon request error: {e}")
         return None
 
@@ -231,6 +240,220 @@ def get_spot_price(symbol: str) -> Optional[float]:
         return None
 
 
+def get_option_trades(option_symbol: str, limit: int = 250) -> pd.DataFrame:
+    """
+    Fetch recent trade prints for a specific options contract.
+    option_symbol: Polygon option ticker, e.g. 'O:AAPL241220C00150000'
+                   or bare format 'AAPL241220C00150000' — O: prefix added automatically.
+    Requires Polygon plan with options trades access.
+    """
+    if not option_symbol.startswith("O:"):
+        option_symbol = f"O:{option_symbol}"
+
+    data = _get(f"/v3/trades/{option_symbol}", {
+        "limit": limit,
+        "order": "desc",
+        "sort":  "timestamp",
+    })
+    if not data or data.get("status") != "OK":
+        return pd.DataFrame()
+
+    rows = []
+    for t in data.get("results", []):
+        ts_ns = t.get("sip_timestamp") or t.get("participant_timestamp") or 0
+        rows.append({
+            "timestamp":  ts_ns,
+            "price":      t.get("price"),
+            "size":       t.get("size") or 0,
+            "exchange":   t.get("exchange"),
+            "conditions": t.get("conditions", []),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns", utc=True)
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def detect_sweeps(trades: pd.DataFrame, ask: float = None) -> list[dict]:
+    """
+    Identify sweep orders from trade prints.
+
+    A sweep is multiple fills within a 2-second window totalling ≥ 50 contracts.
+    Sweeps at/above the ask = aggressive bullish buying.
+    Sweeps at/below a low price = aggressive bearish selling.
+    Returns a list of sweep event dicts.
+    """
+    if trades.empty or len(trades) < 2:
+        return []
+
+    trades = trades.sort_values("timestamp").copy()
+    trades["ts_s"] = trades["timestamp"].astype("int64") // 1_000_000_000
+
+    sweeps = []
+    used = set()
+    for i in trades.index:
+        if i in used:
+            continue
+        t0 = trades.at[i, "ts_s"]
+        window = trades[(trades["ts_s"] >= t0) & (trades["ts_s"] <= t0 + 2)]
+        if len(window) < 2:
+            continue
+        total = int(window["size"].sum())
+        if total < 50:
+            continue
+        avg_px = float((window["price"] * window["size"]).sum() / total)
+        if ask and ask > 0:
+            if avg_px >= ask * 0.98:
+                side = "🟢 BUY sweep"
+            elif avg_px <= ask * 0.80:
+                side = "🔴 SELL sweep"
+            else:
+                side = "⚪ Unknown"
+        else:
+            side = "⚪ Unknown"
+        sweeps.append({
+            "time":      trades.at[i, "timestamp"].strftime("%H:%M:%S UTC"),
+            "contracts": total,
+            "avg_price": round(avg_px, 2),
+            "fills":     len(window),
+            "side":      side,
+            "notional":  int(total * avg_px * 100),
+        })
+        used.update(window.index)
+
+    return sweeps
+
+
+def get_option_iv_history(option_symbol: str, days: int = 30) -> pd.DataFrame:
+    """
+    Daily OHLCV bars for a specific options contract.
+    Use the 'close' price column to track premium movement over time.
+    option_symbol: Polygon option ticker, e.g. 'O:SPY251219C00560000'
+    Requires Polygon plan with options aggregates access.
+    """
+    if not option_symbol.startswith("O:"):
+        option_symbol = f"O:{option_symbol}"
+
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date   = datetime.now().strftime("%Y-%m-%d")
+
+    data = _get(
+        f"/v2/aggs/ticker/{option_symbol}/range/1/day/{from_date}/{to_date}",
+        {"adjusted": "true", "sort": "asc", "limit": 50},
+    )
+    if not data or not data.get("results"):
+        return pd.DataFrame()
+
+    rows = [
+        {
+            "date":   datetime.fromtimestamp(bar["t"] / 1000).strftime("%Y-%m-%d"),
+            "open":   bar.get("o"),
+            "high":   bar.get("h"),
+            "low":    bar.get("l"),
+            "close":  bar.get("c"),
+            "volume": bar.get("v"),
+            "vwap":   bar.get("vw"),
+        }
+        for bar in data["results"]
+    ]
+    return pd.DataFrame(rows)
+
+
 def get_news(symbol: str, limit: int = 20) -> list[dict]:
     """Stub — News requires Stocks plan."""
     return []
+
+
+def get_top_volume_options(top_n: int = 25) -> pd.DataFrame:
+    """
+    Fetch the highest-volume option contracts across the US market.
+
+    Strategy: sample the 20 most liquid option tickers (ETFs + mega-caps)
+    using the per-ticker Polygon snapshot (works on Starter plan).
+    Fetch top 50 contracts each sorted by volume, combine, return top_n.
+    """
+    # Broad universe: ETFs + mega-caps + high-vol names across sectors
+    LIQUID = [
+        # Index ETFs
+        "SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "TLT", "HYG",
+        # Sector ETFs
+        "XLF", "XLE", "XLK", "XLV", "XBI", "ARKK", "SMH",
+        # Mega-cap tech
+        "NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA",
+        # Semis / hardware
+        "AMD", "INTC", "MU", "ARM", "AVGO", "TSM",
+        # High-vol / meme / crypto-adjacent
+        "PLTR", "COIN", "MSTR", "HOOD", "SOFI", "RIVN", "GME",
+        # Finance
+        "JPM", "BAC", "GS", "C", "MS",
+        # Energy
+        "XOM", "CVX", "OXY",
+        # Biotech / health
+        "MRNA", "BNTX", "LLY", "UNH",
+        # Consumer / retail
+        "NFLX", "DIS", "NKE", "BABA",
+        # Other liquid names
+        "F", "T", "UBER", "LYFT", "SQ",
+    ]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch_one(sym):
+        data = _get(f"/v3/snapshot/options/{sym}", {
+            "limit": 250, "order": "asc",
+        })
+        if not data or data.get("status") != "OK":
+            return []
+        rows = []
+        for r in data.get("results", []):
+            greeks = r.get("greeks") or {}
+            detail = r.get("details") or {}
+            quote  = r.get("last_quote") or {}
+            day    = r.get("day") or {}
+            bid    = quote.get("bid") or 0
+            ask    = quote.get("ask") or 0
+            exp    = detail.get("expiration_date", "")
+            vol    = day.get("volume") or 0
+            if vol == 0:
+                continue
+            mid = (bid + ask) / 2 if (bid or ask) else (day.get("close") or 0)
+            rows.append({
+                "ticker":        sym,
+                "type":          detail.get("contract_type", ""),
+                "strike":        detail.get("strike_price"),
+                "expiration":    exp,
+                "dte":           max(0, (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days) if exp else None,
+                "volume":        vol,
+                "open_interest": r.get("open_interest") or 0,
+                "mid":           mid,
+                "iv":            r.get("implied_volatility"),
+                "delta":         greeks.get("delta"),
+                "vega":          greeks.get("vega"),
+                "notional":      int(vol * mid * 100),
+            })
+        return rows
+
+    all_rows = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_fetch_one, sym): sym for sym in LIQUID}
+        for fut in as_completed(futures):
+            try:
+                all_rows.extend(fut.result())
+            except Exception as e:
+                logger.warning(f"Top-volume fetch failed for {futures[fut]}: {e}")
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df = df[df["volume"] > 0]
+
+    # Keep only the single highest-volume contract per ticker
+    df = (df.sort_values("volume", ascending=False)
+            .drop_duplicates(subset="ticker", keep="first")
+            .nlargest(top_n, "volume")
+            .reset_index(drop=True))
+    return df

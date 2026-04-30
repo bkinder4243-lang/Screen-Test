@@ -72,17 +72,29 @@ def oi_walls(chain: pd.DataFrame, top_n: int = 10) -> dict:
     """
     Strikes with highest open interest — these act as S/R levels.
     Call wall = overhead resistance. Put wall = downside support.
+    Expiry shown is the single expiration with the most OI at that strike.
     """
-    by_strike = (
-        chain.groupby(["strike", "type"])[["open_interest", "volume"]]
-        .sum()
-        .reset_index()
-    )
-    calls = by_strike[by_strike["type"] == "call"].nlargest(top_n, "open_interest")
-    puts  = by_strike[by_strike["type"] == "put"].nlargest(top_n, "open_interest")
+    def _top_walls(side_df: pd.DataFrame) -> pd.DataFrame:
+        # Aggregate OI/volume across all expirations per strike
+        agg = (
+            side_df.groupby("strike")[["open_interest", "volume"]]
+            .sum()
+            .reset_index()
+            .nlargest(top_n, "open_interest")
+        )
+        # For each top strike, find the expiry with the highest OI
+        dominant = (
+            side_df.loc[side_df.groupby("strike")["open_interest"].idxmax(),
+                        ["strike", "expiration"]]
+        )
+        result = agg.merge(dominant, on="strike", how="left")
+        return result[["strike", "expiration", "open_interest", "volume"]].reset_index(drop=True)
+
+    calls = chain[chain["type"] == "call"]
+    puts  = chain[chain["type"] == "put"]
     return {
-        "call_walls": calls[["strike", "open_interest", "volume"]].reset_index(drop=True),
-        "put_walls":  puts[["strike",  "open_interest", "volume"]].reset_index(drop=True),
+        "call_walls": _top_walls(calls),
+        "put_walls":  _top_walls(puts),
     }
 
 
@@ -196,10 +208,11 @@ def top_unusual_flow(chain: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
         return pd.DataFrame()
     df["vol_oi_ratio"] = (df["volume"] / df["open_interest"]).round(2)
     df["ua_score"]     = df["vol_oi_ratio"] * df["notional"].apply(lambda x: math.log10(max(x, 1)))
-    top = df.nlargest(top_n, "ua_score")[
-        ["type", "strike", "expiration", "dte", "volume", "open_interest",
-         "vol_oi_ratio", "notional", "mid", "delta", "iv"]
-    ].reset_index(drop=True)
+    keep_cols = [c for c in
+                 ["option_symbol", "type", "strike", "expiration", "dte", "volume",
+                  "open_interest", "vol_oi_ratio", "notional", "mid", "delta", "iv"]
+                 if c in df.columns]
+    top = df.nlargest(top_n, "ua_score")[keep_cols].reset_index(drop=True)
     return top
 
 
