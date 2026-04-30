@@ -1,0 +1,16 @@
+{
+  "symbols": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "TSLA"
+  ],
+  "market_hours": {
+    "open": "09:30",
+    "close": "16:00",
+    "timezone": "ET"
+  }
+}

@@ -1,0 +1,17 @@
+# Data Source Configuration
+data_source: "polygon.io"        # Options: "polygon.io", "fidelity", "yfinance"
+polygon_api_key: ${POLYGON_API_KEY}
+polygon_tier: "professional"     # Required for options data (minimum)
+
+# Execution Broker Configuration
+execution_broker: "fidelity"     # Where to place orders
+fidelity_account_number: ${FIDELITY_ACCOUNT_NUMBER}
+fidelity_oauth_token: ${FIDELITY_OAUTH_TOKEN}
+
+# Caching & Performance
+cache_duration_seconds: 30       # Cache options chains for 30 seconds
+quote_refresh_interval: 5        # Refresh real-time quotes every 5 seconds
+
+# Data Retention
+backtest_data_years: 5           # Keep 5 years of historical options data
+historical_iv_percentile_period: 252  # 1-year rolling percentile for IV Rank

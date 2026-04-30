@@ -1,0 +1,17 @@
+account_size: 20000
+risk_per_trade: 0.05  # 5% max loss per trade
+max_heat: 0.50        # 50% max portfolio delta exposure
+max_leverage: 3.0     # Per position in share equivalents
+max_drawdown_stop: 0.05  # 5% account loss = emergency stop
+
+regime_sizing:
+  NORMAL: 1.0         # Full size
+  ELEVATED: 0.75      # 75% size
+  HIGH: 0.50          # 50% size
+  CRISIS: 0.25        # 25% size
+
+alert_thresholds:
+  greeks_drift_delta: 0.15    # Alert if delta drifts this much
+  breakeven_distance: 0.005   # Alert if spot within 0.5% of BE
+  days_to_expiration: 1       # Auto-exit if <1 DTE
+  drawdown_recovery_size: 0.5 # Reduce size by 50% in recovery

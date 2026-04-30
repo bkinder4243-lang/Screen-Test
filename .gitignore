@@ -1,0 +1,30 @@
+# Credentials
+secrets.env
+config/secrets.env
+*.key
+*.pem
+
+# Data
+data/raw/*
+data/processed/*
+data/historical/*
+*.db
+trades.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
