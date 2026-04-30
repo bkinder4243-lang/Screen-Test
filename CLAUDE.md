@@ -177,3 +177,17 @@ ETF drill-down: scan top holdings of a selected ETF for confluence (ETF consolid
 - Streamlit port: 8501
 - Python: `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`
 - Secrets: `config/secrets.env` (gitignored) — needs `POLYGON_API_KEY`
+
+---
+
+## Integration with Financial Dashboard
+
+This screener is embedded as an iframe inside the Claude Financial Dashboard (React/Vite app).
+
+- Financial Dashboard: `/Users/williamkinder/Desktop/CLAUDE FINANCIAL DASHBOARD/`
+- The "Options Screener" tab in the dashboard nav loads `http://localhost:8501` in an iframe
+- Must run with `--server.enableCORS false --server.enableXsrfProtection false` for iframe to work
+- Unified launcher: `startup dashboard.command` on Desktop starts both apps together
+- Standalone launcher: `startup screener.command` on Desktop starts only this app
+
+Do not add Streamlit `X-Frame-Options` or CORS headers — they break the iframe embedding.
