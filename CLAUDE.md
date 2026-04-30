@@ -145,6 +145,9 @@ Samples ~55 high-liquidity tickers (index ETFs, sector ETFs, mega-caps, semis, f
 - Uses per-ticker `/v3/snapshot/options/{symbol}` — **works on Polygon Starter plan**
 - Global endpoint `/v3/snapshot/options` (no ticker) requires paid plan — not used
 - Cached 5 min in Streamlit via `@st.cache_data(ttl=300)`
+- Ticker universe: SPY, QQQ, IWM, DIA, GLD, SLV, TLT, HYG, XLF, XLE, XLK, XLV, XBI, ARKK, SMH, NVDA, AAPL, MSFT, AMZN, META, GOOGL, TSLA, AMD, INTC, MU, ARM, AVGO, TSM, PLTR, COIN, MSTR, HOOD, SOFI, RIVN, GME, JPM, BAC, GS, C, MS, XOM, CVX, OXY, MRNA, BNTX, LLY, UNH, NFLX, DIS, NKE, BABA, F, T, UBER, LYFT, SQ
+- **Sort parameter** (`sort=day.volume`) is NOT supported by per-ticker snapshot endpoint — fetch 250 and sort locally
+- **Deduplication**: `drop_duplicates(subset="ticker", keep="first")` after sorting by volume
 
 ---
 
@@ -192,6 +195,36 @@ Displayed in Trade Decision tab as 4 full-width rows of 4 metrics each:
 
 Target premium = intrinsic value at tech target + 20% residual time value.
 Stop = −50% of entry premium (standard long-option rule).
+
+---
+
+## Prime Trade Box (Ticker Deep Dive tab)
+Appears below key metrics row. Finds the single best call and single best put from the chain.
+
+**Filters applied:**
+- DTE 14–60
+- Delta 0.28–0.68 (calls) / −0.68–−0.28 (puts)
+- Open interest ≥ chain median
+- IV ≤ chain avg × 1.2 (not overpriced)
+- IV ≥ 5% (not a dead contract)
+- Mid > $0.20
+
+**Scoring weights (0–1 each):**
+- Delta proximity to 0.45 target: 30%
+- Gamma rank within filtered set: 25%
+- OI rank within filtered set: 20%
+- IV cheapness (lower = better within fair range): 15%
+- Theta efficiency (theta/premium ratio): 10%
+
+Displayed as two bordered cards side-by-side: Strike · Expiry · DTE · Mid · Cost/contract · Delta · IV · Gamma · Theta · Vega · OI · Volume.
+
+---
+
+## Journal Live Repricing
+- **Auto-reprices on load**: Watching + Entered entries are repriced via Black-Scholes + yfinance spot automatically when journal tab renders
+- **60-second cache**: stored in `st.session_state["_repriced"]` with timestamp — prevents hammering yfinance on every widget rerender. "🔄 Refresh P&L" forces fresh fetch.
+- **Header shows live price**: `👁️ NVDA · Long Call · $200 strike · exp 2026-05-15 · entry $6.37 → now $7.20 (+13.2%)`
+- **Metrics bar** at top of each expanded entry: Entry Premium · Current Premium · Unrealized P&L (colored) · Stock Now + DTE left
 
 ---
 

@@ -936,6 +936,97 @@ with tab_deep:
 
             st.divider()
 
+            # ── Prime Trade box ───────────────────────────────────────────────
+            def _find_prime_trade(ch, sp):
+                """
+                Score every contract on 5 criteria and return the best call + put.
+                Criteria: delta proximity (0.45 target), gamma rank, above-median OI,
+                          IV not overpriced (≤ chain avg × 1.2), theta/premium ratio.
+                """
+                iv_clean  = ch["iv"].dropna()
+                iv_clean  = iv_clean[(iv_clean >= 0.05) & (iv_clean <= 3.0)]
+                avg_iv    = float(iv_clean.mean()) if not iv_clean.empty else None
+                iv_ceil   = (avg_iv * 1.2) if avg_iv else 3.0
+                med_oi    = float(ch["open_interest"].median())
+                out = {}
+                for opt_type in ["call", "put"]:
+                    s = ch[
+                        (ch["type"] == opt_type) &
+                        (ch["dte"].between(14, 60)) &
+                        (ch["mid"] > 0.20) &
+                        (ch["open_interest"] >= med_oi) &
+                        ch["delta"].notna() & ch["gamma"].notna() &
+                        ch["iv"].notna() &
+                        (ch["iv"] <= iv_ceil) & (ch["iv"] >= 0.05)
+                    ].copy()
+                    tgt = 0.45 if opt_type == "call" else -0.45
+                    if opt_type == "call":
+                        s = s[s["delta"].between(0.28, 0.68)]
+                    else:
+                        s = s[s["delta"].between(-0.68, -0.28)]
+                    if s.empty:
+                        out[opt_type] = None; continue
+                    s["_d"] = 1 - (s["delta"] - tgt).abs().clip(upper=0.25) / 0.25
+                    mx_g = s["gamma"].max()
+                    s["_g"] = s["gamma"] / mx_g if mx_g > 0 else 0
+                    mx_o = s["open_interest"].max()
+                    s["_o"] = s["open_interest"] / mx_o if mx_o > 0 else 0
+                    mn_iv, mx_iv = s["iv"].min(), s["iv"].max()
+                    s["_iv"] = 1 - (s["iv"] - mn_iv) / (mx_iv - mn_iv + 1e-9)
+                    if "theta" in s.columns and s["theta"].notna().any():
+                        s["_tr"] = s["theta"].abs() / s["mid"].clip(lower=0.01)
+                        mx_tr = s["_tr"].max()
+                        s["_t"] = 1 - s["_tr"] / (mx_tr + 1e-9)
+                    else:
+                        s["_t"] = 0.5
+                    s["score"] = (s["_d"]*0.30 + s["_g"]*0.25 +
+                                  s["_o"]*0.20 + s["_iv"]*0.15 + s["_t"]*0.10)
+                    out[opt_type] = s.nlargest(1, "score").iloc[0]
+                return out
+
+            prime = _find_prime_trade(chain, spot)
+            pc, pp = prime.get("call"), prime.get("put")
+
+            if pc is not None or pp is not None:
+                st.markdown("### 💎 Prime Trade")
+                st.caption(
+                    "Best-scoring contract per side: delta near 0.45, above-median OI, "
+                    "IV ≤ chain avg × 1.2, highest gamma, manageable theta decay."
+                )
+                pt1, pt2 = st.columns(2)
+
+                def _render_prime(col, row, label, color):
+                    if row is None:
+                        col.info(f"No qualifying {label} found.")
+                        return
+                    iv_str    = f"{row['iv']:.0%}"      if pd.notna(row.get("iv"))    else "—"
+                    delta_str = f"{row['delta']:.2f}"   if pd.notna(row.get("delta")) else "—"
+                    gamma_str = f"{row['gamma']:.4f}"   if pd.notna(row.get("gamma")) else "—"
+                    theta_str = f"{row['theta']:.3f}"   if pd.notna(row.get("theta")) else "—"
+                    vega_str  = f"{row['vega']:.3f}"    if pd.notna(row.get("vega"))  else "—"
+                    mid_str   = f"${row['mid']:.2f}"
+                    oi_str    = f"{int(row['open_interest']):,}"
+                    vol_str   = f"{int(row['volume']):,}"
+                    cost_str  = f"${row['mid']*100:.0f}"
+                    with col:
+                        with st.container(border=True):
+                            st.markdown(f"**{label}** — ${row['strike']:.2f} · {row['expiration']} · {int(row['dte'])}DTE")
+                            g1, g2, g3 = st.columns(3)
+                            g1.metric("Mid",   mid_str, delta=f"{cost_str}/contract", delta_color="off")
+                            g2.metric("Delta", delta_str)
+                            g3.metric("IV",    iv_str)
+                            g4, g5, g6 = st.columns(3)
+                            g4.metric("Gamma",  gamma_str)
+                            g5.metric("Theta",  theta_str)
+                            g6.metric("Vega",   vega_str)
+                            g7, g8 = st.columns(2)
+                            g7.metric("Open Interest", oi_str)
+                            g8.metric("Volume Today",  vol_str)
+
+                _render_prime(pt1, pc, "📈 Prime Call", "success")
+                _render_prime(pt2, pp, "📉 Prime Put",  "error")
+                st.divider()
+
             # ── Row 2: Walls + Unusual Flow ────────────────────────────────────
             w1, w2, w3 = st.columns(3)
 
@@ -1411,11 +1502,14 @@ with tab_journal:
     if df_journal.empty:
         st.info("No journal entries yet. Run the screener, inspect a ticker, and click **📓 Save to Journal**.")
     else:
-        # Reprice if requested
-        repriced = {}
-        if refresh_prices:
-            with st.spinner("Fetching live prices…"):
-                repriced = reprice_all_open()
+        # Auto-reprice open entries; cache for 60s to avoid hitting yfinance on every rerender
+        import time as _jtime
+        _cache_age = _jtime.time() - st.session_state.get("_reprice_ts", 0)
+        if refresh_prices or _cache_age > 60:
+            with st.spinner("Fetching live premiums…"):
+                st.session_state["_repriced"]   = reprice_all_open()
+                st.session_state["_reprice_ts"] = _jtime.time()
+        repriced = st.session_state.get("_repriced", {})
 
         # ── Summary cards ─────────────────────────────────────────────────────
         open_df   = df_journal[df_journal["status"].isin(["Watching","Entered"])]
@@ -1464,12 +1558,47 @@ with tab_journal:
             strike     = _safe_float(strike)
             entry_prem = _safe_float(entry_prem)
             status_icon = {"Watching": "👁️", "Entered": "✅", "Closed": "🔒"}.get(status, "")
-            header = (f"{status_icon} **{sym}** · {strategy} · "
-                      f"${strike:.0f} strike · exp {expiry} · "
-                      f"entry ${entry_prem:.2f}" if (strike is not None and entry_prem) else
-                      f"{status_icon} **{sym}** · {strategy} · exp {expiry}")
+
+            # Build header — include live premium + P&L for open entries
+            _base = (f"${strike:.0f} strike · exp {expiry}"
+                     if strike is not None else f"exp {expiry}")
+            if status in ("Watching", "Entered") and entry_prem:
+                if cur_prem is not None and upnl_pct is not None:
+                    _pnl_sign = "+" if upnl_pct >= 0 else ""
+                    _header_price = f"entry ${entry_prem:.2f} → now ${cur_prem:.2f}  ({_pnl_sign}{upnl_pct:.1f}%)"
+                else:
+                    _header_price = f"entry ${entry_prem:.2f}"
+            elif status == "Closed" and entry_prem:
+                _header_price = f"entry ${entry_prem:.2f}"
+            else:
+                _header_price = ""
+            header = f"{status_icon} **{sym}** · {strategy} · {_base} · {_header_price}"
 
             with st.expander(header, expanded=(status == "Entered")):
+                # ── Live premium bar (Watching / Entered only) ────────────────
+                if status in ("Watching", "Entered") and entry_prem:
+                    lp1, lp2, lp3, lp4 = st.columns(4)
+                    lp1.metric("Entry Premium",   f"${entry_prem:.2f}",
+                               delta=f"${entry_prem*100:.0f}/contract", delta_color="off")
+                    if cur_prem is not None:
+                        lp2.metric("Current Premium", f"${cur_prem:.2f}",
+                                   delta=f"${cur_prem*100:.0f}/contract", delta_color="off")
+                        lp3.metric("Unrealized P&L",
+                                   f"${upnl:+.2f}" if upnl is not None else "—",
+                                   delta=f"{upnl_pct:+.1f}%" if upnl_pct is not None else None,
+                                   delta_color="normal" if (upnl or 0) >= 0 else "inverse")
+                        lp4.metric("Stock Now",
+                                   f"${cur_stock:.2f}" if cur_stock else "—",
+                                   delta=f"{dte_left}d left" if dte_left is not None else None,
+                                   delta_color="off")
+                    else:
+                        lp2.metric("Current Premium", "—")
+                        lp3.metric("Unrealized P&L",  "—")
+                        lp4.metric("Stock Now",
+                                   f"${cur_stock:.2f}" if cur_stock else "—")
+                    if expired:
+                        st.error("⚠️ Option has expired")
+                    st.divider()
                 d1, d2, d3 = st.columns(3)
                 with d1:
                     st.markdown("**Entry details**")
@@ -1490,24 +1619,8 @@ with tab_journal:
                     if row['analyst_target']:
                         st.write(f"**Analyst target:** ${row['analyst_target']:.2f}")
 
-                    if status in ("Watching", "Entered") and cur_stock:
-                        st.markdown("---")
-                        st.markdown("**Current (live)**")
-                        st.write(f"**Stock now:** ${cur_stock:.2f}")
-                        if dte_left is not None:
-                            st.write(f"**DTE left:** {dte_left}")
-                        if expired:
-                            st.warning("Option has expired")
-                        elif cur_prem is not None:
-                            st.write(f"**Est. premium:** ${cur_prem:.2f}")
-                            color = "green" if (upnl or 0) >= 0 else "red"
-                            st.markdown(
-                                f"**Unrealized P&L:** "
-                                f"<span style='color:{color}'>${upnl:+.2f} ({upnl_pct:+.1f}%)</span>",
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            st.info("Click 🔄 Refresh P&L to see live value")
+                    if status in ("Watching", "Entered") and dte_left is not None:
+                        st.write(f"**DTE left:** {dte_left}")
 
                     elif status == "Closed":
                         st.markdown("---")
