@@ -16,6 +16,8 @@ from screener.scorer            import build_result, ScreenerResult
 from screener.universe          import load_universe, UNIVERSES
 from screener.etf_universe      import ETF_UNIVERSE, get_etf_holdings, etf_category
 from screener.journal           import add_entry, get_entries, close_entry, delete_entry, reprice_all_open, update_notes
+from screener.ticker_analysis   import full_analysis
+from screener.polygon_client    import get_spot_price
 
 st.set_page_config(page_title="Options Screener", page_icon="📊", layout="wide")
 
@@ -281,7 +283,7 @@ exclude_earnings = st.sidebar.checkbox("🚫 Exclude earnings risk", value=True,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.title("📊 Options Swing Screener")
-tab_scanner, tab_journal = st.tabs(["📊 Scanner", "📓 Journal"])
+tab_scanner, tab_deep, tab_journal = st.tabs(["📊 Scanner", "🔍 Ticker Deep Dive", "📓 Journal"])
 
 
 # ── Scan helpers ──────────────────────────────────────────────────────────────
@@ -769,6 +771,228 @@ with tab_scanner:
                 for g in ["delta","gamma","theta","vega"]:
                     disp[g] = disp[g].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
                 st.dataframe(disp, use_container_width=True, hide_index=True, height=380)
+
+# ── Deep Dive tab ─────────────────────────────────────────────────────────────
+with tab_deep:
+    st.markdown("### 🔍 Single-Ticker Options Analysis")
+    st.caption("Full chain breakdown — PCR, max pain, GEX, call/put walls, IV surface, unusual flow, and confluence score.")
+
+    dd_col1, dd_col2 = st.columns([2, 5])
+    with dd_col1:
+        dd_sym = st.text_input("Ticker", placeholder="e.g. AAPL", key="dd_ticker",
+                               label_visibility="collapsed").upper().strip()
+    with dd_col2:
+        dd_dte_max = st.slider("Chain DTE window", 7, 120, 90, key="dd_dte",
+                               help="How many days out to load the chain")
+
+    run_dd = st.button("▶ Analyze", key="dd_run", type="primary")
+
+    if run_dd and dd_sym:
+        with st.spinner(f"Fetching {dd_sym} options chain…"):
+            dd_chain = get_options_chain(dd_sym, dte_min=0, dte_max=dd_dte_max)
+            dd_spot  = get_spot_price(dd_sym)
+
+        if dd_chain is None or dd_chain.empty:
+            st.error(f"No options data returned for **{dd_sym}**. Check the ticker or Polygon key.")
+        elif not dd_spot:
+            st.error(f"Could not fetch spot price for **{dd_sym}**.")
+        else:
+            st.session_state["dd_result"] = {
+                "sym":   dd_sym,
+                "chain": dd_chain,
+                "spot":  dd_spot,
+            }
+
+    if "dd_result" in st.session_state:
+        dr    = st.session_state["dd_result"]
+        sym   = dr["sym"]
+        chain = dr["chain"]
+        spot  = dr["spot"]
+
+        with st.spinner("Computing analysis…"):
+            ana = full_analysis(chain, spot)
+
+        if not ana:
+            st.warning("Analysis returned no data.")
+        else:
+            pcr_d  = ana["pcr"]
+            pain   = ana["max_pain"]
+            walls  = ana["walls"]
+            gex_df = ana["gex_df"]
+            net_g  = ana["net_gex"]
+            term   = ana["term"]
+            skew   = ana["skew"]
+            clust  = ana["clusters"]
+            flow   = ana["flow"]
+            hi_iv  = ana["high_iv"]
+            conf   = ana["confluence"]
+
+            # ── Banner: Confluence Lean ────────────────────────────────────────
+            lean_color = {"🟢🟢": "success", "🟢": "success",
+                          "🔴🔴": "error",   "🔴": "error"}.get(
+                conf["lean"].split()[0], "info")
+            getattr(st, lean_color)(
+                f"**{sym} @ ${spot:.2f}** — Confluence lean: **{conf['lean']}** (score {conf['score']:+d})"
+            )
+
+            # ── Row 1: Key metrics ─────────────────────────────────────────────
+            m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+            pv = pcr_d.get("pcr_volume")
+            po = pcr_d.get("pcr_oi")
+            gex_bn = net_g / 1_000_000_000
+
+            def _pcr_delta(v):
+                if v is None: return None
+                if v < 0.7:   return "bullish"
+                if v > 1.0:   return "bearish"
+                return "neutral"
+
+            m1.metric("Spot",          f"${spot:.2f}")
+            m2.metric("Max Pain",      f"${pain:.2f}" if pain else "—",
+                      delta=f"{(spot-pain)/pain*100:+.1f}%" if pain else None)
+            m3.metric("PCR (volume)",  f"{pv:.2f}" if pv else "—",
+                      delta=_pcr_delta(pv), delta_color="inverse")
+            m4.metric("PCR (OI)",      f"{po:.2f}" if po else "—")
+            m5.metric("Call Volume",   f"{pcr_d['call_volume']:,}")
+            m6.metric("Put Volume",    f"{pcr_d['put_volume']:,}")
+            m7.metric("Net GEX",       f"${gex_bn:+.2f}B",
+                      delta="Pinning" if gex_bn > 0 else "Vol expansion",
+                      delta_color="normal" if gex_bn > 0 else "inverse")
+
+            st.divider()
+
+            # ── Row 2: Walls + Unusual Flow ────────────────────────────────────
+            w1, w2, w3 = st.columns(3)
+
+            with w1:
+                st.markdown("**📈 Call Walls (resistance / upside targets)**")
+                cw = walls["call_walls"].copy()
+                cw.columns = ["Strike", "Open Interest", "Volume"]
+                cw["Strike"] = cw["Strike"].apply(lambda x: f"${x:.2f}")
+                cw["Open Interest"] = cw["Open Interest"].apply(lambda x: f"{int(x):,}")
+                cw["Volume"] = cw["Volume"].apply(lambda x: f"{int(x):,}")
+                st.dataframe(cw, hide_index=True, use_container_width=True)
+
+            with w2:
+                st.markdown("**📉 Put Walls (support / downside levels)**")
+                pw = walls["put_walls"].copy()
+                pw.columns = ["Strike", "Open Interest", "Volume"]
+                pw["Strike"] = pw["Strike"].apply(lambda x: f"${x:.2f}")
+                pw["Open Interest"] = pw["Open Interest"].apply(lambda x: f"{int(x):,}")
+                pw["Volume"] = pw["Volume"].apply(lambda x: f"{int(x):,}")
+                st.dataframe(pw, hide_index=True, use_container_width=True)
+
+            with w3:
+                st.markdown("**🔥 Top Unusual Flow (vol/OI × notional)**")
+                if not flow.empty:
+                    fl = flow.copy()
+                    fl["iv"]         = fl["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+                    fl["delta"]      = fl["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                    fl["mid"]        = fl["mid"].apply(lambda x: f"${x:.2f}")
+                    fl["notional"]   = fl["notional"].apply(lambda x: f"${int(x):,}")
+                    fl["vol_oi_ratio"] = fl["vol_oi_ratio"].apply(lambda x: f"{x:.1f}x")
+                    fl["strike"]     = fl["strike"].apply(lambda x: f"${x:.2f}")
+                    fl["type"]       = fl["type"].str.upper()
+                    st.dataframe(
+                        fl[["type","strike","expiration","dte","volume","vol_oi_ratio","notional","mid","delta","iv"]],
+                        hide_index=True, use_container_width=True,
+                        column_config={"type": st.column_config.TextColumn("Type", width="small")}
+                    )
+                else:
+                    st.info("No unusual flow found (need vol ≥ 100, OI ≥ 50, notional ≥ $25K).")
+
+            st.divider()
+
+            # ── Row 3: Volume clusters + High IV ──────────────────────────────
+            vc1, vc2 = st.columns(2)
+
+            with vc1:
+                st.markdown("**⚡ Top Volume Contracts (most active today)**")
+                if not clust.empty:
+                    cl = clust.copy()
+                    cl["iv"]       = cl["iv"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+                    cl["delta"]    = cl["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                    cl["mid"]      = cl["mid"].apply(lambda x: f"${x:.2f}")
+                    cl["notional"] = cl["notional"].apply(lambda x: f"${int(x):,}")
+                    cl["strike"]   = cl["strike"].apply(lambda x: f"${x:.2f}")
+                    cl["type"]     = cl["type"].str.upper()
+                    st.dataframe(
+                        cl[["type","strike","expiration","dte","volume","open_interest","mid","delta","iv","notional"]],
+                        hide_index=True, use_container_width=True,
+                    )
+                else:
+                    st.info("No volume data.")
+
+            with vc2:
+                st.markdown("**🌡️ Highest IV Contracts (most expensive premium)**")
+                if not hi_iv.empty:
+                    hi = hi_iv.copy()
+                    hi["iv"]    = hi["iv"].apply(lambda x: f"{x:.0%}")
+                    hi["delta"] = hi["delta"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+                    hi["mid"]   = hi["mid"].apply(lambda x: f"${x:.2f}")
+                    hi["strike"] = hi["strike"].apply(lambda x: f"${x:.2f}")
+                    hi["type"]   = hi["type"].str.upper()
+                    st.dataframe(
+                        hi[["type","strike","expiration","dte","iv","mid","delta","volume","open_interest"]],
+                        hide_index=True, use_container_width=True,
+                    )
+                else:
+                    st.info("No high-IV contracts found.")
+
+            st.divider()
+
+            # ── Row 4: IV Term Structure + IV Skew ────────────────────────────
+            ts1, ts2 = st.columns(2)
+
+            with ts1:
+                st.markdown("**📅 IV Term Structure** (avg IV by DTE bucket)")
+                if not term.empty:
+                    t = term.copy()
+                    t["avg_iv"] = t["avg_iv"].apply(lambda x: f"{x:.1%}")
+                    t.columns   = ["DTE Bucket", "Avg IV", "# Contracts"]
+                    st.dataframe(t, hide_index=True, use_container_width=True)
+                    # Backwardation warning
+                    ivs = ana["term"]["avg_iv"].values
+                    if len(ivs) >= 2 and ivs[0] > ivs[-1] * 1.15:
+                        st.warning("⚠️ IV backwardation — near-term vol elevated. Likely event/earnings premium.")
+                else:
+                    st.info("Not enough data for term structure.")
+
+            with ts2:
+                st.markdown("**📐 IV Skew by Expiry** (call IV − put IV per expiry)")
+                if not skew.empty:
+                    sk = skew.copy()
+                    sk["call_iv"] = sk["call_iv"].apply(lambda x: f"{x:.1%}")
+                    sk["put_iv"]  = sk["put_iv"].apply(lambda x: f"{x:.1%}")
+                    sk["skew"]    = sk["skew"].apply(
+                        lambda x: f"+{x:.1%} 📈" if x > 0.02 else (f"{x:.1%} 📉" if x < -0.02 else f"{x:.1%}")
+                    )
+                    st.dataframe(sk, hide_index=True, use_container_width=True)
+                    st.caption("Positive skew = call IV > put IV (bullish demand). Negative = normal protective buying.")
+                else:
+                    st.info("Not enough data for skew.")
+
+            st.divider()
+
+            # ── GEX by Strike chart ────────────────────────────────────────────
+            with st.expander("📊 Gamma Exposure (GEX) by Strike", expanded=False):
+                if not gex_df.empty:
+                    st.caption(
+                        "Positive GEX = dealers long gamma → price-pinning effect near that strike. "
+                        "Negative GEX = dealers short gamma → moves accelerate through that level."
+                    )
+                    gex_disp = gex_df.copy()
+                    gex_disp["gex_m"] = gex_disp["gex_m"].round(1)
+                    gex_disp["strike"] = gex_disp["strike"].apply(lambda x: f"${x:.2f}")
+                    gex_disp.columns = ["Strike", "GEX ($M)", "GEX_M"]
+                    st.bar_chart(gex_disp.set_index("Strike")["GEX ($M)"])
+                else:
+                    st.info("No gamma data — greeks not available from Polygon Starter plan on this ticker.")
+
+            # ── Confluence signals detail ──────────────────────────────────────
+            with st.expander("🧭 Confluence Signals Detail", expanded=True):
+                for icon, msg in conf["signals"]:
+                    st.markdown(f"{icon} {msg}")
 
 # ── Journal tab ───────────────────────────────────────────────────────────────
 with tab_journal:
