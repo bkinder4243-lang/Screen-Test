@@ -148,11 +148,11 @@ def get_options_chain(symbol: str, dte_min: int = 7, dte_max: int = 90) -> Optio
     return df
 
 
-def get_unusual_activity(symbol: str, chain: pd.DataFrame) -> dict:
+def get_unusual_activity(symbol: str, options_chain_data: pd.DataFrame) -> dict:
     """
     Scan an already-fetched chain for institutional-grade unusual flow.
 
-    Scoring: vol/OI ratio × log10(notional) rewards large-premium trades,
+    Scoring: volume-to-oi ratio × log10(notional) rewards large-premium trades,
     not just high ratios on tiny volume.
 
     Criteria:
@@ -163,53 +163,53 @@ def get_unusual_activity(symbol: str, chain: pd.DataFrame) -> dict:
       - vol/OI >= 1.5
     """
     empty = {
-        "unusual": False, "vol_oi_ratio": 0.0, "notional": 0,
+        "unusual": False, "volume_to_oi_ratio": 0.0, "notional_usd": 0,
         "strike": None, "expiration": None, "type": None,
         "volume": 0, "open_interest": 0, "direction_hint": None,
     }
 
-    if chain is None or chain.empty:
+    if options_chain_data is None or options_chain_data.empty:
         return empty
 
-    c = chain[
-        (chain["volume"] >= 500) &
-        (chain["open_interest"] >= 200) &
-        (chain["mid"] > 0) &
-        (chain.get("dte", pd.Series(dtype=float)) >= 7)
+    filtered_chain = options_chain_data[
+        (options_chain_data["volume"] >= 500) &
+        (options_chain_data["open_interest"] >= 200) &
+        (options_chain_data["mid"] > 0) &
+        (options_chain_data.get("dte", pd.Series(dtype=float)) >= 7)
     ].copy()
-    if c.empty:
+    if filtered_chain.empty:
         # Fall back to looser thresholds for low-volume tickers
-        c = chain[
-            (chain["volume"] >= 100) &
-            (chain["open_interest"] >= 50) &
-            (chain["mid"] > 0)
+        filtered_chain = options_chain_data[
+            (options_chain_data["volume"] >= 100) &
+            (options_chain_data["open_interest"] >= 50) &
+            (options_chain_data["mid"] > 0)
         ].copy()
-    if c.empty:
+    if filtered_chain.empty:
         return empty
 
-    c["notional"]     = c["volume"] * c["mid"] * 100
-    c = c[c["notional"] >= 50_000]
-    if c.empty:
+    filtered_chain["notional_usd"]     = filtered_chain["volume"] * filtered_chain["mid"] * 100
+    filtered_chain = filtered_chain[filtered_chain["notional_usd"] >= 50_000]
+    if filtered_chain.empty:
         return empty
 
-    c["vol_oi_ratio"] = c["volume"] / c["open_interest"]
-    c = c[c["vol_oi_ratio"] >= 1.5]
-    if c.empty:
+    filtered_chain["volume_to_oi_ratio"] = filtered_chain["volume"] / filtered_chain["open_interest"]
+    filtered_chain = filtered_chain[filtered_chain["volume_to_oi_ratio"] >= 1.5]
+    if filtered_chain.empty:
         return empty
 
-    c["ua_score"] = c["vol_oi_ratio"] * c["notional"].apply(lambda x: math.log10(max(x, 1)))
-    best = c.nlargest(1, "ua_score").iloc[0]
+    filtered_chain["unusual_activity_score"] = filtered_chain["volume_to_oi_ratio"] * filtered_chain["notional_usd"].apply(lambda x: math.log10(max(x, 1)))
+    best_contract = filtered_chain.nlargest(1, "unusual_activity_score").iloc[0]
 
     return {
         "unusual":        True,
-        "vol_oi_ratio":   round(float(best["vol_oi_ratio"]), 1),
-        "notional":       int(best["notional"]),
-        "strike":         best["strike"],
-        "expiration":     best["expiration"],
-        "type":           best["type"],
-        "volume":         int(best["volume"]),
-        "open_interest":  int(best["open_interest"]),
-        "direction_hint": "bullish" if best["type"] == "call" else "bearish",
+        "volume_to_oi_ratio":   round(float(best_contract["volume_to_oi_ratio"]), 1),
+        "notional_usd":       int(best_contract["notional_usd"]),
+        "strike":         best_contract["strike"],
+        "expiration":     best_contract["expiration"],
+        "type":           best_contract["type"],
+        "volume":         int(best_contract["volume"]),
+        "open_interest":  int(best_contract["open_interest"]),
+        "direction_hint": "bullish" if best_contract["type"] == "call" else "bearish",
     }
 
 
@@ -277,7 +277,7 @@ def get_option_trades(option_symbol: str, limit: int = 250) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def detect_sweeps(trades: pd.DataFrame, ask: float = None) -> list[dict]:
+def identify_institutional_sweeps(trades: pd.DataFrame, ask_price: float = None) -> list[dict]:
     """
     Identify sweep orders from trade prints.
 
@@ -305,10 +305,10 @@ def detect_sweeps(trades: pd.DataFrame, ask: float = None) -> list[dict]:
         if total < 50:
             continue
         avg_px = float((window["price"] * window["size"]).sum() / total)
-        if ask and ask > 0:
-            if avg_px >= ask * 0.98:
+        if ask_price and ask_price > 0:
+            if avg_px >= ask_price * 0.98:
                 side = "🟢 BUY sweep"
-            elif avg_px <= ask * 0.80:
+            elif avg_px <= ask_price * 0.80:
                 side = "🔴 SELL sweep"
             else:
                 side = "⚪ Unknown"

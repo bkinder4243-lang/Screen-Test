@@ -342,7 +342,7 @@ def confluence_score(
 
 # ── Master entry point ─────────────────────────────────────────────────────────
 
-def full_analysis(chain: pd.DataFrame, spot: float) -> dict:
+def compute_full_options_analysis(chain: pd.DataFrame, spot: float) -> dict:
     """
     Run all analyses and return a single dict of results.
     Caller passes the already-fetched chain and live spot price.

@@ -65,7 +65,7 @@ def _parse_52w(raw) -> tuple[Optional[float], Optional[float]]:
     return price, pct
 
 
-def _price_context(symbol: str) -> dict:
+def _fetch_stock_price_context(symbol: str) -> dict:
     """
     Fetch price history + calendar via yfinance. Computes:
       range_5d_pct        : (5d high - 5d low) / close × 100
@@ -143,11 +143,11 @@ def _price_context(symbol: str) -> dict:
             "days_to_earnings":       days_to_earnings,
         }
     except Exception as e:
-        logger.debug(f"_price_context failed for {symbol}: {e}")
+        logger.debug(f"_fetch_stock_price_context failed for {symbol}: {e}")
         return {}
 
 
-def detect_setup(info: dict) -> str:
+def identify_swing_trade_setup(info: dict) -> str:
     """
     Classify the current technical pattern.
 
@@ -242,8 +242,8 @@ def get_technicals(symbol: str) -> Optional[dict]:
             "atr":              atr,
         }
 
-        data.update(_price_context(symbol))
-        data["setup"] = detect_setup(data)
+        data.update(_fetch_stock_price_context(symbol))
+        data["setup"] = identify_swing_trade_setup(data)
         return data
 
     except Exception as e:

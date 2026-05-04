@@ -22,7 +22,7 @@ from typing import Optional
 import pandas as pd
 
 
-def score_trade(
+def score_intraday_entry_signals(
     direction: str,
     spot: float,
     intraday: dict,
@@ -198,7 +198,7 @@ def score_trade(
     return {"score": score, "grade": grade, "color": color, "signals": signals}
 
 
-def build_entry_card(
+def format_entry_card_metrics(
     symbol: str,
     direction: str,
     spot: float,

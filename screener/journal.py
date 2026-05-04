@@ -61,7 +61,7 @@ def _init_db():
 _init_db()
 
 
-def add_entry(r, status: str = "Watching", notes: str = "") -> int:
+def add_trade_to_journal(r, status: str = "Watching", notes: str = "") -> int:
     """Save a ScreenerResult to the journal. Returns the new row id."""
     mid = (r.rec_bid + r.rec_ask) / 2 if r.rec_bid and r.rec_ask else None
     with _conn() as con:
@@ -155,7 +155,7 @@ def get_entries(status_filter: str = "All") -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows])
 
 
-def close_entry(entry_id: int, exit_price: float) -> None:
+def close_trade_position(entry_id: int, exit_price: float) -> None:
     """Mark an entry as Closed with an exit price and compute realized P&L."""
     with _conn() as con:
         row = con.execute("SELECT entry_premium, strategy FROM journal WHERE id=?",
@@ -183,7 +183,7 @@ def update_notes(entry_id: int, notes: str) -> None:
         con.execute("UPDATE journal SET notes=? WHERE id=?", (notes, entry_id))
 
 
-def reprice_entry(row: dict) -> dict:
+def reprice_trade_with_blackscholes(row: dict) -> dict:
     """
     Re-estimate current option value via Black-Scholes using live spot price.
     Returns a dict with keys: current_stock, current_premium, unrealized_pnl, unrealized_pnl_pct, dte_remaining.
@@ -239,7 +239,7 @@ def reprice_all_open() -> dict[int, dict]:
     open_df = df[df["status"].isin(["Watching", "Entered"])]
     results = {}
     for _, row in open_df.iterrows():
-        results[int(row["id"])] = reprice_entry(row.to_dict())
+        results[int(row["id"])] = reprice_trade_with_blackscholes(row.to_dict())
     return results
 
 

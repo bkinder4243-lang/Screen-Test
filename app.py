@@ -10,7 +10,7 @@ import streamlit as st
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from screener.polygon_client    import (get_options_chain, get_unusual_activity, key_is_working,
-                                        get_top_volume_options, get_option_trades, detect_sweeps,
+                                        get_top_volume_options, get_option_trades, identify_institutional_sweeps,
                                         get_option_iv_history)
 from screener.finviz_client     import get_technicals
 from screener.oi_tracker        import save_snapshot, get_oi_change, get_iv_history
@@ -18,11 +18,12 @@ from screener.stocktwits_client import get_sentiment
 from screener.scorer            import build_result, ScreenerResult
 from screener.universe          import load_universe, UNIVERSES
 from screener.etf_universe      import ETF_UNIVERSE, get_etf_holdings, etf_category
-from screener.journal           import add_entry, add_entry_raw, get_entries, close_entry, delete_entry, reprice_all_open, update_notes
-from screener.ticker_analysis   import full_analysis
+from screener.journal           import add_trade_to_journal, add_entry_raw, get_entries, close_trade_position, delete_entry, reprice_all_open, update_notes
+from screener.ticker_analysis   import compute_full_options_analysis
 from screener.polygon_client    import get_spot_price
 from screener.intraday          import get_relative_strength, gex_flip_level
-from screener.conviction        import score_trade, build_entry_card
+from screener.conviction        import score_intraday_entry_signals, format_entry_card_metrics
+from screener.confluence        import compute_confluence
 
 st.set_page_config(page_title="Options Screener", page_icon="📊", layout="wide")
 
@@ -167,10 +168,10 @@ st.sidebar.title("⚙️ Settings")
 def _check_polygon_key():
     return key_is_working()
 
-poly_ok = _check_polygon_key()
+polygon_api_key_valid = _check_polygon_key()
 from screener.polygon_client import _last_api_error as _poly_err
-_poly_status = "🟢" if poly_ok else "🔴"
-_poly_detail  = f" — {_poly_err['msg']}" if not poly_ok and _poly_err.get("msg") else ""
+_poly_status = "🟢" if polygon_api_key_valid else "🔴"
+_poly_detail  = f" — {_poly_err['msg']}" if not polygon_api_key_valid and _poly_err.get("msg") else ""
 st.sidebar.markdown(
     f"{_poly_status} Polygon.io (options + greeks){_poly_detail}  \n"
     "🟢 Finviz (technicals)  \n"
@@ -267,21 +268,21 @@ else:
 st.sidebar.divider()
 st.sidebar.subheader("Filters")
 
-max_premium = st.sidebar.slider(
+max_entry_cost_per_contract = st.sidebar.slider(
     "Max premium per contract ($)",
     min_value=1.0, max_value=20.0, value=6.0, step=0.5,
     help="Mid-price cap. $6 = $600/contract."
 )
 
-dte_range = st.sidebar.slider("DTE window", 7, 90, (21, 45))
+days_to_expiry_window = st.sidebar.slider("DTE window", 7, 90, (21, 45))
 
-min_delta = st.sidebar.slider(
+min_directional_delta_target = st.sidebar.slider(
     "Min |delta| for strike",
     min_value=0.20, max_value=0.70, value=0.40, step=0.05,
     help="0.40–0.50 = ATM-ish directional play"
 )
 
-max_iv = st.sidebar.slider(
+max_implied_vol_threshold = st.sidebar.slider(
     "Max IV (avg for expiry window)",
     min_value=10, max_value=100, value=60, step=5,
     format="%d%%",
@@ -289,7 +290,12 @@ max_iv = st.sidebar.slider(
 )
 
 st.sidebar.divider()
-unusual_only     = st.sidebar.checkbox("🔥 Unusual activity only", value=False)
+filter_unusual_activity_only     = st.sidebar.checkbox("🔥 Unusual activity only", value=False)
+min_confluence_score_threshold   = st.sidebar.slider(
+    "Min confluence score",
+    min_value=0, max_value=100, value=40, step=5,
+    help="Filter results by institutional flow + intraday alignment score (0–100)"
+)
 exclude_earnings = st.sidebar.checkbox("🚫 Exclude earnings risk", value=True,
     help="Hide tickers with earnings inside your DTE window (binary event risk)")
 
@@ -437,7 +443,7 @@ def _render_scanner_tab():
             st.error("No tickers loaded. Check your universe selection.")
             return
 
-        raw_results = []
+        screened_ticker_results = []
         prog  = st.progress(0)
         label = st.empty()
 
@@ -466,9 +472,9 @@ def _render_scanner_tab():
                 prog.progress(50 + int((i + 1) / len(survivors) * 50))
                 label.write(f"Fetching options for **{sym}** ({i+1}/{len(survivors)})…")
                 try:
-                    raw_results.append(_fetch_full_result((
-                        sym, tech_data.get(sym), poly_ok,
-                        max_premium, dte_range[0], dte_range[1],
+                    screened_ticker_results.append(_fetch_full_result((
+                        sym, tech_data.get(sym), polygon_api_key_valid,
+                        max_entry_cost_per_contract, days_to_expiry_window[0], days_to_expiry_window[1],
                     )))
                 except Exception as e:
                     st.warning(f"Skipped {sym}: {e}")
@@ -478,27 +484,66 @@ def _render_scanner_tab():
                 label.write(f"Scanning **{ticker}** ({i+1}/{len(tickers)})…")
                 finviz = get_technicals(ticker)
                 senti  = get_sentiment(ticker)
-                chain  = get_options_chain(ticker, dte_min=7, dte_max=90) if poly_ok else None
-                ua     = get_unusual_activity(ticker, chain) if chain is not None else {}
-                raw_results.append(build_result(
-                    ticker, finviz, senti, None, chain, ua,
-                    max_mid=max_premium, dte_min=dte_range[0], dte_max=dte_range[1],
+                options_chain_data  = get_options_chain(ticker, dte_min=7, dte_max=90) if polygon_api_key_valid else None
+                ua     = get_unusual_activity(ticker, options_chain_data) if options_chain_data is not None else {}
+                screened_ticker_results.append(build_result(
+                    ticker, finviz, senti, None, options_chain_data, ua,
+                    max_mid=max_entry_cost_per_contract, dte_min=days_to_expiry_window[0], dte_max=days_to_expiry_window[1],
                 ))
 
         prog.empty()
         label.empty()
 
-        if not raw_results:
+        if not screened_ticker_results:
             st.error("No data returned.")
             st.stop()
 
-        st.session_state["results"] = raw_results
+        # ── Compute confluence scores for each result ──────────────────────────
+        label = st.empty()
+        confluence_scores = {}
+        for i, r in enumerate(screened_ticker_results):
+            label.write(f"Computing confluence for **{r.symbol}**…")
+            try:
+                # Get intraday data (VWAP + RS vs SPY)
+                intraday = None
+                try:
+                    intraday = get_relative_strength(r.symbol)
+                except:
+                    intraday = {}
+
+                # Get GEX flip level (simple heuristic: compute from chain if available)
+                chain_data = {}
+                if r.has_options:
+                    try:
+                        from screener.intraday import gex_flip_level
+                        # The result may have chain data; try to use it
+                        # For now, skip GEX computation as we don't have easy access to the chain here
+                        # In Trade Decision tab, we'll compute it fresh with full data
+                        pass
+                    except:
+                        pass
+
+                # Compute confluence score
+                conf_result = compute_confluence(r, intraday, chain_data)
+                confluence_scores[r.symbol] = conf_result
+            except Exception as e:
+                # If confluence fails, set to neutral
+                from screener.confluence import ConfluenceResult
+                confluence_scores[r.symbol] = ConfluenceResult(
+                    confluence_score=50.0, flow_signal="none", vwap_alignment=0.0,
+                    rs_bias=0.0, gex_favorable=False, iv_regime="fair", conviction_grade="MARGINAL"
+                )
+        label.empty()
+
+        st.session_state["results"] = screened_ticker_results
+        st.session_state["confluence_scores"] = confluence_scores
 
     if "results" not in st.session_state:
         st.info("Configure your strategy and tickers in the sidebar, then click **▶ Run Screener**.")
         return
 
     results = st.session_state["results"]
+    confluence_scores = st.session_state.get("confluence_scores", {})
 
     # ── Filter ────────────────────────────────────────────────────────────────
     def keep(r: ScreenerResult) -> bool:
@@ -545,6 +590,10 @@ def _render_scanner_tab():
             return False
         if exclude_earnings and r.earnings_within_dte:
             return False
+        # Confluence filter
+        conf = confluence_scores.get(r.symbol)
+        if conf and conf.confluence_score < min_confluence:
+            return False
         return True
 
     shown = sorted([r for r in results if keep(r)],
@@ -556,6 +605,21 @@ def _render_scanner_tab():
         f"**{len(shown)}** match **{selected_strategy}** · "
         f"🔥 {total_unusual} with unusual activity"
     )
+
+    # ── Sort option ───────────────────────────────────────────────────────────
+    sort_col1, sort_col2 = st.columns([1, 4])
+    with sort_col1:
+        sort_by = st.selectbox(
+            "Sort by",
+            ["Composite Score", "Confluence Score", "Setup"],
+            label_visibility="collapsed"
+        )
+
+    if sort_by == "Confluence Score":
+        shown = sorted(shown, key=lambda r: confluence_scores.get(r.symbol,
+                       type('', (), {'confluence_score': 0})()).confluence_score, reverse=True)
+    elif sort_by == "Setup":
+        shown = sorted(shown, key=lambda r: r.setup or "", reverse=False)
 
     if not shown:
         st.warning(
@@ -581,11 +645,35 @@ def _render_scanner_tab():
     # ── Results table ─────────────────────────────────────────────────────────
     st.subheader(f"Matches — {selected_strategy}")
     rows = [r.to_row() for r in shown]
+
+    # Add confluence score column
+    for i, r in enumerate(shown):
+        conf = confluence_scores.get(r.symbol)
+        if conf:
+            grade_icon = {"HIGH": "🟢", "MODERATE": "🟡", "MARGINAL": "🟠", "PASS": "🔴"}.get(
+                conf.conviction_grade, "⚪"
+            )
+            rows[i]["Confluence"] = f"{grade_icon} {conf.confluence_score:.0f}"
+            rows[i]["Flow"] = conf.flow_signal.replace("_", " ").title() if conf.flow_signal != "none" else "—"
+        else:
+            rows[i]["Confluence"] = "—"
+            rows[i]["Flow"] = "—"
+
     df   = pd.DataFrame(rows)
-    small_cols = ["Dir","Score","RSI","Rel Vol","Unusual","Strike","Mid","Delta","IV Env","IV Premium","DTE","Earnings","BE Move","R/BE"]
+    # Reorder columns to put Confluence near the front
+    cols = list(df.columns)
+    if "Confluence" in cols:
+        cols.remove("Confluence")
+        cols.insert(2, "Confluence")  # After "Dir"
+    if "Flow" in cols:
+        cols.remove("Flow")
+        cols.insert(3, "Flow")
+    df = df[cols]
+
+    small_cols = ["Dir","Confluence","Flow","Score","RSI","Rel Vol","Unusual","Strike","Mid","Delta","IV Env","IV Premium","DTE","Earnings","BE Move","R/BE"]
     st.dataframe(
         df, use_container_width=True, hide_index=True,
-        column_config={c: st.column_config.TextColumn(width="small") for c in small_cols},
+        column_config={c: st.column_config.TextColumn(width="small") for c in small_cols if c in df.columns},
     )
 
     # ── Detail panel ──────────────────────────────────────────────────────────
@@ -813,7 +901,7 @@ def _render_scanner_tab():
         if st.form_submit_button("📓 Save to Journal"):
             if not r.has_options:
                 st.warning("No option strike found — save anyway as a watchlist entry?")
-            entry_id = add_entry(r, status=j_status, notes=j_notes)
+            entry_id = add_trade_to_journal(r, status=j_status, notes=j_notes)
             st.success(f"Saved **{r.symbol}** to journal (#{entry_id}) as **{j_status}**. View in the Journal tab.")
 
     # ── Full chain ────────────────────────────────────────────────────────────
@@ -882,7 +970,7 @@ with tab_deep:
         spot  = dr["spot"]
 
         with st.spinner("Computing analysis…"):
-            ana = full_analysis(chain, spot)
+            ana = compute_full_options_analysis(chain, spot)
 
         if not ana:
             st.warning("Analysis returned no data.")
@@ -1111,7 +1199,7 @@ with tab_deep:
                         if not opt_sym:
                             continue
                         trades_df = get_option_trades(opt_sym, limit=200)
-                        sweeps = detect_sweeps(trades_df)
+                        sweeps = identify_institutional_sweeps(trades_df)
                         if sweeps:
                             any_sweeps = True
                             st.markdown(f"**{opt_sym}**")
@@ -1336,15 +1424,15 @@ with tab_decide:
         if not flow.empty and "option_symbol" in flow.columns:
             top_opt = flow["option_symbol"].dropna().head(1).tolist()
             if top_opt:
-                from screener.polygon_client import get_option_trades, detect_sweeps
+                from screener.polygon_client import get_option_trades, identify_institutional_sweeps
                 td_trades = get_option_trades(top_opt[0], limit=200)
-                sweep_found = len(detect_sweeps(td_trades)) > 0
+                sweep_found = len(identify_institutional_sweeps(td_trades)) > 0
 
         # Technical target from finviz
         tech_target = fin.get("technical_target") if fin else None
 
         # Score
-        result = score_trade(
+        result = score_intraday_entry_signals(
             direction=dirx, spot=spot, intraday=rs,
             pcr_data=pcr_d, pain=pain, net_gex=net_g,
             gex_flip=flip, flow=flow, iv_premium=iv_prem,
@@ -1353,7 +1441,7 @@ with tab_decide:
         score_val = result["score"]
 
         # Entry card
-        card = build_entry_card(
+        card = format_entry_card_metrics(
             symbol=sym, direction=dirx, spot=spot,
             strike=float(best_row["strike"]) if best_row is not None else None,
             premium=float(best_row["mid"])   if best_row is not None else None,
@@ -1363,6 +1451,21 @@ with tab_decide:
             tech_target=tech_target,
             iv=float(best_row["iv"])         if best_row is not None and pd.notna(best_row.get("iv")) else None,
             score=score_val,
+        )
+
+        # ── Confluence score ─────────────────────────────────────────────────
+        # Create minimal ScreenerResult-like object for confluence computation
+        class _TempResult:
+            unusual = False
+            unusual_type = None
+            price = spot
+            iv_premium = iv_prem
+            has_options = True
+
+        conf_result = compute_confluence(
+            screener_result=_TempResult(),
+            intraday_data=rs,
+            chain_data={'gex_flip_level': flip} if flip else {}
         )
 
         # ── Conviction banner ─────────────────────────────────────────────────
@@ -1375,6 +1478,21 @@ with tab_decide:
 
         # ── Score bar ─────────────────────────────────────────────────────────
         st.progress(score_val / 100)
+
+        # ── Confluence metrics ────────────────────────────────────────────────
+        conf_col1, conf_col2, conf_col3, conf_col4 = st.columns(4)
+        with conf_col1:
+            grade_color = {"HIGH": "🟢", "MODERATE": "🟡", "MARGINAL": "🟠", "PASS": "🔴"}.get(
+                conf_result.conviction_grade, "⚪"
+            )
+            st.metric("Confluence", f"{grade_color} {conf_result.confluence_score:.0f}/100",
+                      delta=conf_result.conviction_grade, delta_color="off")
+        with conf_col2:
+            st.metric("Flow Signal", conf_result.flow_signal.replace("_", " ").title() if conf_result.flow_signal != "none" else "None")
+        with conf_col3:
+            st.metric("VWAP Align", f"{conf_result.vwap_alignment:.0f}/20 pts")
+        with conf_col4:
+            st.metric("Relative Strength", f"{conf_result.rs_bias:.0f}/20 pts")
 
         st.divider()
 
@@ -1646,7 +1764,7 @@ with tab_journal:
                                                       value=float(cur_prem) if cur_prem else 0.0,
                                                       key=f"exit_px_{entry_id}")
                             if st.form_submit_button("🔒 Close position"):
-                                close_entry(entry_id, exit_px)
+                                close_trade_position(entry_id, exit_px)
                                 st.rerun()
 
                     note_key = f"note_{entry_id}"
