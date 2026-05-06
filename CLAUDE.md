@@ -324,3 +324,128 @@ This screener is embedded as an iframe inside the Claude Financial Dashboard (Re
 - Standalone launcher: `startup screener.command` on Desktop starts only this app
 
 Do not add Streamlit `X-Frame-Options` or CORS headers — they break the iframe embedding.
+
+---
+
+## GitHub Workflow — Efficient Updates
+
+**Goal:** Keep GitHub in sync with minimal token usage. Follow this protocol after completing features or phases.
+
+### When to Commit & Push
+
+**Auto-commit on phase completion:**
+1. ✅ Phase goal achieved (all acceptance criteria met)
+2. ✅ Code compiles/runs without errors
+3. ✅ Tests pass (if applicable)
+
+**DO NOT commit if:**
+- Feature is incomplete or blocked
+- Code has syntax errors or import issues
+- Tests are failing
+
+### Commit Message Format
+
+```
+<type>: <subject> [<component>]
+
+<brief description of changes>
+
+Changes:
+- Specific change 1
+- Specific change 2
+- Specific change 3 (only if ≤5 changes; else summarize category)
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+```
+
+**Types:** `feat`, `fix`, `refactor`, `docs`, `test`, `perf`  
+**Components:** `[confluence]`, `[conviction]`, `[scanner]`, `[journal]`, `[ui]`
+
+**Example:**
+```
+feat: Add confluence scoring to scanner results [confluence]
+
+Combines institutional flow (40%) + intraday momentum (40%) + gamma structure (20%).
+Surfaces high-conviction setups at top of ticker list.
+
+Changes:
+- New module: screener/confluence.py with ConfluenceResult dataclass
+- Scanner sorts by confluence score (configurable min threshold)
+- Updated app.py to compute confluence per result in Pass 2
+```
+
+### Efficient Batching
+
+**Group related changes:** If working on a single feature across multiple files (e.g., naming refactor), batch them into ONE commit.
+
+```bash
+# ✅ GOOD — single atomic commit
+git add screener/conviction.py screener/journal.py app.py
+git commit -m "Complete naming refactor across conviction + journal modules"
+
+# ❌ BAD — artificial per-file commits inflate history
+git commit -m "Rename score_trade in conviction.py"  # commit 1
+git commit -m "Rename close_entry in journal.py"      # commit 2
+```
+
+### Token-Efficient Workflow
+
+1. **Work locally** — no commits until feature completes
+2. **Batch changes** — group by feature/component, not by file
+3. **One commit per logical unit** — not per file or line change
+4. **Verify before pushing** — `git log --oneline -5` + `python3 -m py_compile` on modified files
+5. **Push once** — `git push` merges and sends to remote in one operation
+
+### After Each Phase
+
+**Immediately after completing a phase goal:**
+
+```bash
+# 1. Check status
+git status
+
+# 2. Verify compilation
+python3 -m py_compile screener/*.py app.py
+
+# 3. Stage changes
+git add screener/ app.py docs/ # (only project files, not data/)
+
+# 4. Commit with message (follow format above)
+git commit -m "feat: <phase goal> [<component>]"
+
+# 5. Verify log
+git log --oneline -3
+
+# 6. Push (automatic after commit — AI will handle if instructed)
+git push
+```
+
+### Files to NEVER Commit
+
+```
+.env / secrets.env          — API keys and credentials
+data/journal.db             — User trade history (sensitive)
+data/oi_tracker.db          — Historical market snapshots
+.DS_Store                   — macOS artifacts
+__pycache__ / .pytest_cache — Build artifacts
+node_modules / dist         — Dependencies (use package-lock.json)
+```
+
+These are already in `.gitignore` — verify `git status` doesn't show them.
+
+### Merging to Main
+
+Trading System uses `main` branch directly (no feature branches needed for single-dev work).
+
+**When phase is complete and pushed:**
+```bash
+# Already on main? Just push.
+git push
+
+# If on feature branch (rare):
+git checkout main
+git merge feature-name
+git push
+```
+
+Financial Dashboard uses feature branches → merge to main after tests pass.
